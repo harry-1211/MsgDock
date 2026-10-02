@@ -5,6 +5,10 @@ on:
   push:
     branches:
       - claude/ui-status-first
+  # Also build pull requests into the shared development branch.
+  pull_request:
+    branches:
+      - maintenance/shared-workspace
 
 jobs:
   android-and-cloudflare:
