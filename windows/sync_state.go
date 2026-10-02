@@ -136,6 +136,7 @@ type syncInput struct {
 	Backlog         int  // pending entries still waiting for an ACK
 	Sending         bool // an ACK or a fetch that carried new messages is in flight
 	NotifyFailed    bool // the latest native Toast failed
+	NotifyDisabled  bool // Windows accepted the Toast but reports notifications as off for this app
 	LastSMSAt       int64
 	LastSMSDevice   string
 }
@@ -215,8 +216,12 @@ func syncActions(in syncInput) []syncAction {
 	if in.AuthFailed {
 		actions = append(actions, syncAction{Kind: syncActionRelogin, Text: "账号授权已失效，重新登录后恢复互联网短信。", Button: "重新登录"})
 	}
-	if in.NotifyFailed {
+	switch {
+	case in.NotifyFailed:
 		actions = append(actions, syncAction{Kind: syncActionNotifications, Text: "Windows 通知发送失败，短信仍会保存到历史。", Button: "打开通知设置"})
+	case in.NotifyDisabled:
+		// DESIGN.md row 3 (关闭了通知): Windows accepts the Toast but drops it.
+		actions = append(actions, syncAction{Kind: syncActionNotifications, Text: "Windows 已关闭 MsgDock 的通知，新短信不会弹出，仍会保存到历史。", Button: "开启通知"})
 	}
 	if !in.AccountLoggedIn && !in.CloudPaired {
 		actions = append(actions, syncAction{Kind: syncActionConnectRemote, Text: "登录账号或配对云端，离开局域网也能收到", Button: "去设置"})
@@ -278,6 +283,21 @@ func coarseDuration(age time.Duration) string {
 	default:
 		return fmt.Sprintf("%d 天", int(age/(24*time.Hour)))
 	}
+}
+
+// countdownText says when a pending cloud pair code expires, in the same
+// Chinese units as the rest of the window rather than Go's "4m59s".
+func countdownText(remaining time.Duration) string {
+	if remaining <= 0 {
+		return "已过期"
+	}
+	remaining = remaining.Round(time.Second)
+	minutes := int(remaining / time.Minute)
+	seconds := int((remaining % time.Minute) / time.Second)
+	if minutes > 0 {
+		return fmt.Sprintf("%d 分 %02d 秒后到期", minutes, seconds)
+	}
+	return fmt.Sprintf("%d 秒后到期", seconds)
 }
 
 // formatSMSTime is the table's time column: clock time today, date otherwise.

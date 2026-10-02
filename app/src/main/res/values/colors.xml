@@ -33,6 +33,8 @@
 
     <!-- Semantic -->
     <color name="divider">#1E293B</color>
+    <!-- Strokes that must read as an edge on a card (outlined buttons, inputs); the divider is too close to the surfaces. -->
+    <color name="outline">#3B4D61</color>
     <color name="overlay_scrim">#CC000000</color>
     <color name="ripple_light">#33FFFFFF</color>
     <color name="ripple_dark">#33000000</color>

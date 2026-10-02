@@ -203,8 +203,10 @@ public class SyncStateTest {
         in.now = NOW;
         in.lanTargets = 1;
         assertEquals(SyncState.Action.GRANT_SMS, first(SyncState.evaluate(in)));
-        in.canReceiveSms = false;
-        assertTrue(SyncState.evaluate(in).items.isEmpty());
+        in.canReceiveSms = false; // a LAN target is useless without SMS: no permission row, but no route either
+        SyncState.Result tablet = SyncState.evaluate(in);
+        assertEquals(1, tablet.items.size());
+        assertEquals(SyncState.Action.ADD_ROUTE, first(tablet));
         in.canReceiveSms = true;
         in.lanTargets = 0;
         assertEquals(SyncState.Action.ADD_ROUTE, first(SyncState.evaluate(in)));
@@ -239,6 +241,64 @@ public class SyncStateTest {
         assertEquals(SyncState.Kind.ATTENTION, r.kind);
         assertEquals("登录账号或添加接收端", r.items.get(0).button);
         in.cloudReceiverLinks = 1; // a receive source counts as a route
+        assertTrue(SyncState.evaluate(in).items.isEmpty());
+    }
+
+    @Test public void primaryItemIsTheOneTheReasonDescribes() {
+        // Needs-action: the first item is the reason, so the card owns its button and
+        // the list only carries the rest.
+        SyncState.Input in = sender();
+        in.smsPermission = false;
+        in.deadLetters = 2;
+        SyncState.Result r = SyncState.evaluate(in);
+        assertEquals(SyncState.Kind.ATTENTION, r.kind);
+        assertEquals(SyncState.Action.GRANT_SMS, r.primary.action);
+        assertEquals(r.primary.text, r.reason);
+        assertEquals(1, r.remainingItems().size());
+        assertEquals(SyncState.Action.DEAD_LETTERS, r.remainingItems().get(0).action);
+        // A single item leaves nothing for the list at all.
+        in.deadLetters = 0;
+        assertTrue(SyncState.evaluate(in).remainingItems().isEmpty());
+        // Broken by auth: the reason is about the account, so relogin moves into the card.
+        in.authRequired = true;
+        r = SyncState.evaluate(in);
+        assertEquals(SyncState.Kind.BROKEN, r.kind);
+        assertEquals(SyncState.Action.RELOGIN, r.primary.action);
+        assertEquals(1, r.remainingItems().size());
+        assertEquals(SyncState.Action.GRANT_SMS, r.remainingItems().get(0).action);
+        // Offline: the reason is the network, nothing moves into the card.
+        in.online = false;
+        r = SyncState.evaluate(in);
+        assertEquals(null, r.primary);
+        assertEquals(r.items, r.remainingItems());
+    }
+
+    @Test public void deviceWithoutTelephonyNeedsReceivingNotJustLogin() {
+        SyncState.Input in = new SyncState.Input();
+        in.now = NOW;
+        in.canReceiveSms = false;
+        SyncState.Result r = SyncState.evaluate(in);
+        assertEquals(SyncState.Kind.ATTENTION, r.kind);
+        assertEquals(SyncState.Action.ADD_ROUTE, first(r));
+        assertEquals("登录账号", r.items.get(0).button);
+        // Logged in but not receiving: still nothing is happening, offer the one switch.
+        in.loggedIn = true;
+        r = SyncState.evaluate(in);
+        assertEquals(SyncState.Kind.ATTENTION, r.kind);
+        assertEquals(SyncState.Action.ENABLE_RECEIVE, first(r));
+        assertEquals("开启接收", r.items.get(0).button);
+        // Receiving on: a normal receiver.
+        in.accountReceive = true;
+        in.receiverEnabled = true;
+        in.pollIntervalMs = 3000L;
+        in.lastSuccessAt = NOW - 2000L;
+        r = SyncState.evaluate(in);
+        assertEquals(SyncState.Kind.OK, r.kind);
+        assertEquals("接收局域网、账号。", r.reason);
+        // A phone that logged in is a forwarder even before receiving is on.
+        in.canReceiveSms = true;
+        in.receiverEnabled = false;
+        in.smsPermission = true;
         assertTrue(SyncState.evaluate(in).items.isEmpty());
     }
 

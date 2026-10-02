@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -385,5 +386,99 @@ func TestReplayPendingKeepsNotifiedLANLedgerWithoutRepushing(t *testing.T) {
 	}
 	if len(stored) != 1 || stored[0].ID != pending.ID || stored[0].NotifiedAt == 0 {
 		t.Fatalf("LAN ledger after replay = %#v", stored)
+	}
+}
+
+func TestInstanceHandoverSignalsThenRetriesMutexThenGivesUp(t *testing.T) {
+	pauses := 0
+	pause := func() { pauses++ }
+
+	// A listening instance takes over on the first attempt without waiting.
+	startup, signaled := instanceHandover(func() bool { return true }, func() bool { t.Fatal("mutex retried after signal"); return false }, 3, pause)
+	if startup || !signaled || pauses != 0 {
+		t.Fatalf("listening instance: startup=%v signaled=%v pauses=%d", startup, signaled, pauses)
+	}
+
+	// An instance that is still shutting down releases the mutex later; the
+	// second launch must then continue starting up instead of complaining.
+	attempts := 0
+	startup, signaled = instanceHandover(func() bool { return false }, func() bool { attempts++; return attempts == 3 }, 5, pause)
+	if !startup || signaled || attempts != 3 || pauses != 2 {
+		t.Fatalf("shutting-down instance: startup=%v signaled=%v attempts=%d pauses=%d", startup, signaled, attempts, pauses)
+	}
+
+	// An old version never listens and never leaves: give up after the budget.
+	pauses = 0
+	startup, signaled = instanceHandover(func() bool { return false }, func() bool { return false }, 4, pause)
+	if startup || signaled || pauses != 3 {
+		t.Fatalf("old instance: startup=%v signaled=%v pauses=%d", startup, signaled, pauses)
+	}
+}
+
+func TestTrayHintFlagPersistsAndDefaultsToUnshown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"pairCode":"123456","relayUrl":"https://example.test","trayFallbackEnabled":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := loadConfigFiles(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: cfg, dir: filepath.Dir(path)}
+	if app.trayHintShown() {
+		t.Fatal("old config must show the hint once")
+	}
+	if err := app.markTrayHintShown(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _, err := loadConfigFiles(path)
+	if err != nil || !reloaded.TrayHintShown || !reloaded.TrayFallbackEnabled || reloaded.PairCode != "123456" {
+		t.Fatalf("reloaded = %+v err=%v", reloaded, err)
+	}
+}
+
+func TestEmptyInboxTextPointsToPairCodeOnlyWithoutRemotePath(t *testing.T) {
+	lanOnly := emptyInboxText(false)
+	if !strings.Contains(lanOnly, "局域网配对码") || !strings.Contains(lanOnly, "添加接收端") {
+		t.Fatalf("LAN-only empty state = %q", lanOnly)
+	}
+	remote := emptyInboxText(true)
+	if strings.Contains(remote, "配对码") || !strings.Contains(remote, "Windows 通知") {
+		t.Fatalf("remote empty state = %q", remote)
+	}
+}
+
+func TestShutdownContextCancelsUserRequestsOnClose(t *testing.T) {
+	app := &App{dir: t.TempDir()}
+	if app.shutdownContext().Err() != nil {
+		t.Fatal("test-built App must never be cancelled")
+	}
+	app.shutdownCtx, app.cancelShutdown = context.WithCancel(context.Background())
+	app.beginClosing()
+	if !app.isClosing() || !errors.Is(app.shutdownContext().Err(), context.Canceled) {
+		t.Fatal("beginClosing must cancel user-initiated requests")
+	}
+}
+
+func TestNotificationWorkerProbeDoesNotPushAndSurvivesMissingHook(t *testing.T) {
+	pushes, probes := 0, 0
+	worker := newNotificationWorker(func(SMS) error { pushes++; return nil })
+	go worker.run()
+	t.Cleanup(worker.shutdown)
+	if err := worker.probeSetting(); err != nil || pushes != 0 {
+		t.Fatalf("probe without hook: err=%v pushes=%d", err, pushes)
+	}
+	worker.probe = func() error { probes++; return errors.New("setting unavailable") }
+	if err := worker.probeSetting(); err == nil || probes != 1 || pushes != 0 {
+		t.Fatalf("probe with hook: err=%v probes=%d pushes=%d", err, probes, pushes)
+	}
+	app := &App{dir: t.TempDir()}
+	app.probeNotificationSetting() // no worker installed: must be a no-op
+	app.mu.Lock()
+	app.notify = worker
+	app.mu.Unlock()
+	app.probeNotificationSetting()
+	if probes != 2 {
+		t.Fatalf("app probe count = %d, want 2", probes)
 	}
 }

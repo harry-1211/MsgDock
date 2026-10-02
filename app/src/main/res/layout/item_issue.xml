@@ -45,12 +45,15 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"/>
 
+        <!-- Takes the leftover width so it wraps at large font sizes instead of being clipped. -->
         <Button
             android:id="@+id/btn_issue_link"
             style="@style/Button.Link"
-            android:layout_width="wrap_content"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
             android:layout_marginStart="@dimen/spacing_sm"
+            android:gravity="start|center_vertical"
             android:text="后台设置教程"
             android:visibility="gone"/>
     </LinearLayout>

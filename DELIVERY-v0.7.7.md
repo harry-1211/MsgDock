@@ -20,7 +20,7 @@
 
 | 文件 | 状态 | SHA-256 |
 |---|---|---|
-| MsgDock-Windows-v0.7.7.exe | 已在 Linux 交叉编译，未在 Windows 上运行 | D53ABD367209B6E5D67F9DF3BD7FFD8657D01C91D5245CE083A35FF9E88241A3 |
+| MsgDock-Windows-v0.7.7.exe | 已在 Linux 交叉编译，未在 Windows 上运行 | D421925774E1795978697F580B082100B2143669EA8B0AA6ED4A264BD3656FCC |
 | MsgDock-Android-v0.7.7-debug.apk | 待在本机构建 | - |
 
 APK 必须用 v0.7.6 的同一个调试证书构建，证书 SHA-256 应为 `8b72e245377b56f06af95753d8fd396a880bf608a3161b6c175e443d94dbf82a`。签名不一致时，Android 不能覆盖升级，本机身份也无法继承。

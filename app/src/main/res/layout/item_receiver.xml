@@ -55,6 +55,5 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginStart="@dimen/spacing_sm"
-        android:minHeight="36dp"
         android:text="移除"/>
 </LinearLayout>

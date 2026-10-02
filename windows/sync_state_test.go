@@ -308,3 +308,37 @@ func TestPendingBacklogCountsOnlyOwedEntries(t *testing.T) {
 		t.Fatal("empty backlog")
 	}
 }
+
+func TestSyncActionsReportDisabledNotificationsBelowFailures(t *testing.T) {
+	in := healthyInput()
+	in.NotifyDisabled = true
+	s := evaluateSyncState(in)
+	if s.Level != syncAttention || len(s.Actions) != 1 || s.Actions[0].Kind != syncActionNotifications {
+		t.Fatalf("disabled notifications: %+v", s)
+	}
+	if !strings.Contains(s.Actions[0].Text, "已关闭") || s.Actions[0].Button != "开启通知" {
+		t.Fatalf("disabled action = %+v", s.Actions[0])
+	}
+	// A failed push is the more specific problem and keeps the single row.
+	in.NotifyFailed = true
+	actions := syncActions(in)
+	if len(actions) != 1 || !strings.Contains(actions[0].Text, "发送失败") {
+		t.Fatalf("failed+disabled actions = %+v", actions)
+	}
+}
+
+func TestCountdownTextUsesChineseUnits(t *testing.T) {
+	for _, tc := range []struct {
+		remaining time.Duration
+		want      string
+	}{
+		{-time.Second, "已过期"}, {0, "已过期"},
+		{59*time.Second + 400*time.Millisecond, "59 秒后到期"},
+		{4*time.Minute + 59*time.Second, "4 分 59 秒后到期"},
+		{10 * time.Minute, "10 分 00 秒后到期"},
+	} {
+		if got := countdownText(tc.remaining); got != tc.want {
+			t.Errorf("countdownText(%s) = %q, want %q", tc.remaining, got, tc.want)
+		}
+	}
+}

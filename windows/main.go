@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -29,6 +31,11 @@ const (
 	appVersion    = "0.7.7"
 	// shutdownGrace bounds the cleanup after the user chooses 退出.
 	shutdownGrace = 10 * time.Second
+	// instanceHandoverAttempts × instanceHandoverPause is how long a second
+	// launch waits for the running instance to either answer the show-window
+	// event or release the mutex (it may still be shutting down).
+	instanceHandoverAttempts = 12
+	instanceHandoverPause    = 250 * time.Millisecond
 	// defaultRelayURL is kept in one place so the desktop client and its
 	// installer can be changed without hunting through the cloud code.
 	defaultRelayURL = "https://xgy-sms-relay.xgy2021sh.workers.dev"
@@ -45,7 +52,10 @@ type Config struct {
 	// NotificationPreview is "full", "sender" or "minimal"; see
 	// parseNotificationPreview. Missing (configs from older versions) means full.
 	NotificationPreview string `json:"notificationPreview,omitempty"`
-	trayFallbackPresent bool   `json:"-"`
+	// TrayHintShown records that the one-time "still running in the tray"
+	// balloon has been shown after the user first closed the window.
+	TrayHintShown       bool `json:"trayHintShown,omitempty"`
+	trayFallbackPresent bool `json:"-"`
 }
 
 // UnmarshalJSON keeps old config files compatible while recording whether the
@@ -58,6 +68,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		Account             AccountCredentials `json:"account"`
 		TrayFallbackEnabled bool               `json:"trayFallbackEnabled"`
 		NotificationPreview string             `json:"notificationPreview"`
+		TrayHintShown       bool               `json:"trayHintShown"`
 	}
 	var fields configFields
 	if err := json.Unmarshal(data, &fields); err != nil {
@@ -73,6 +84,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	c.Account = fields.Account
 	c.TrayFallbackEnabled = fields.TrayFallbackEnabled
 	c.NotificationPreview = fields.NotificationPreview
+	c.TrayHintShown = fields.TrayHintShown
 	_, c.trayFallbackPresent = raw["trayFallbackEnabled"]
 	if !c.trayFallbackPresent {
 		c.TrayFallbackEnabled = true
@@ -101,15 +113,21 @@ type App struct {
 	pendingLoaded    bool
 	closing          atomic.Bool
 	notifyFailed     atomic.Bool  // latest native Toast attempt failed; shown in the status header
+	notifyDisabled   atomic.Bool  // Windows reports notifications for this app as turned off
 	sending          atomic.Int32 // fetches that carried new messages, and their ACKs, currently in flight
-	logFile          *os.File
-	recent           []SMS
-	seenIDs          map[string]struct{}
-	ui               *desktopUI
-	server           *http.Server
-	notify           *notificationWorker
-	cloud            *cloudClient
-	account          *accountClient
+	// shutdownCtx is cancelled by beginClosing so user-initiated requests
+	// (login, pairing) stop blocking the exit instead of running to their
+	// 15 s HTTP timeout. Nil means a test-constructed App; see shutdownContext.
+	shutdownCtx    context.Context
+	cancelShutdown context.CancelFunc
+	logFile        *os.File
+	recent         []SMS
+	seenIDs        map[string]struct{}
+	ui             *desktopUI
+	server         *http.Server
+	notify         *notificationWorker
+	cloud          *cloudClient
+	account        *accountClient
 }
 
 func main() {
@@ -130,16 +148,41 @@ func main() {
 	if err != nil {
 		log.Printf("single instance check failed: %v", err)
 	}
+	if alreadyRunning {
+		// The mutex may belong to a healthy instance (ask it to show its window),
+		// to one that is still shutting down (wait for the mutex) or to a version
+		// too old to listen (explain). Auto-start (--tray) never pops a window.
+		releaseSingleInstance(instance)
+		instance = 0
+		startup, _ := instanceHandover(func() bool {
+			return signalRunningInstance(!startInTray)
+		}, func() bool {
+			handle, running, err := acquireSingleInstance()
+			if err == nil && !running {
+				instance = handle
+				return true
+			}
+			releaseSingleInstance(handle)
+			return false
+		}, instanceHandoverAttempts, func() { time.Sleep(instanceHandoverPause) })
+		if !startup {
+			if !startInTray {
+				showAlreadyRunning()
+			}
+			return
+		}
+	}
 	if instance != 0 {
 		defer releaseSingleInstance(instance)
 	}
-	if alreadyRunning {
-		// Auto-start (--tray) stays silent; a manual launch brings the running
-		// window forward, and only an older instance gets the explanation.
-		if !startInTray && !signalRunningInstance() {
-			showAlreadyRunning()
-		}
-		return
+	// Create the show-window event as early as possible so an impatient second
+	// double-click during startup finds it instead of the "old version" dialog.
+	showEvent, err := createShowInstanceEvent()
+	if err != nil {
+		log.Printf("create show-window event failed: %v", err)
+		showEvent = 0
+	} else {
+		defer windows.CloseHandle(showEvent)
 	}
 
 	if err := app.startServer(); err != nil {
@@ -160,10 +203,16 @@ func main() {
 	if err := app.initializeNotifications(); err != nil {
 		notificationsReady = false
 		log.Printf("initialize Windows notifications failed: %v", err)
+	} else {
+		// Report muted notifications before the first SMS; the window repeats
+		// the probe every settingProbeInterval.
+		go app.probeNotificationSetting()
 	}
 
 	cloud := newCloudClient(app)
+	app.mu.Lock()
 	app.cloud = cloud
+	app.mu.Unlock()
 	cloudCtx, cancelCloud := context.WithCancel(context.Background())
 	go cloud.run(cloudCtx)
 	account := newAccountClient(app)
@@ -178,7 +227,7 @@ func main() {
 	if notificationsReady && ui.window != nil {
 		ui.window.Synchronize(func() {
 			go func() {
-				if err := cloud.replayPending(context.Background()); err != nil {
+				if err := cloud.replayPending(cloudCtx); err != nil && !app.isClosing() {
 					log.Printf("replay pending notifications failed: %v", err)
 				}
 			}()
@@ -188,7 +237,7 @@ func main() {
 	if !startInTray {
 		ui.showStatus()
 	}
-	ui.run()
+	ui.run(showEvent)
 
 	// A hung shutdown would keep holding the single-instance mutex with no tray
 	// icon, so the next launch says "already running" although nothing is
@@ -200,7 +249,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Stop new inputs first. Cloud cancellation then lets any in-flight poll
+	// Stop new inputs first (beginClosing also cancels user-initiated account
+	// and pairing requests). Cloud cancellation then lets any in-flight poll
 	// finish before the notification worker and native window are disposed.
 	app.beginClosing()
 	cancelAnnounce()
@@ -272,6 +322,7 @@ func newApp() (*App, error) {
 		}
 	}
 	app := &App{cfg: cfg, dir: dir, seenIDs: make(map[string]struct{}), logFile: lf}
+	app.shutdownCtx, app.cancelShutdown = context.WithCancel(context.Background())
 	if err := app.loadHistory(); err != nil {
 		log.Printf("load SMS history failed: %v", err)
 	}
@@ -317,6 +368,41 @@ func (a *App) setTrayFallbackEnabled(enabled bool) error {
 		cfg.TrayFallbackEnabled = enabled
 		cfg.trayFallbackPresent = true
 	})
+}
+
+func (a *App) trayHintShown() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cfg.TrayHintShown
+}
+
+func (a *App) markTrayHintShown() error {
+	return a.updateConfig(func(cfg *Config) { cfg.TrayHintShown = true })
+}
+
+// shutdownContext is the context for user-initiated network calls. It is
+// cancelled by beginClosing; Apps built directly in tests never close.
+func (a *App) shutdownContext() context.Context {
+	if a.shutdownCtx == nil {
+		return context.Background()
+	}
+	return a.shutdownCtx
+}
+
+func (a *App) cloudClient() *cloudClient {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cloud
+}
+
+// latestSMS returns the newest history entry without copying the whole list.
+func (a *App) latestSMS() (SMS, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.recent) == 0 {
+		return SMS{}, false
+	}
+	return a.recent[0], true
 }
 
 func (a *App) notificationPreview() notificationPreview {
@@ -498,6 +584,9 @@ func (a *App) isClosing() bool {
 
 func (a *App) beginClosing() {
 	a.closing.Store(true)
+	if a.cancelShutdown != nil {
+		a.cancelShutdown()
+	}
 }
 
 func (a *App) closeLog() {
@@ -514,8 +603,8 @@ func (a *App) status(w http.ResponseWriter, r *http.Request) {
 	}
 	cloudState := "disabled"
 	cloudPaired := false
-	if a.cloud != nil {
-		snapshot := a.cloud.snapshot()
+	if cloud := a.cloudClient(); cloud != nil {
+		snapshot := cloud.snapshot()
 		cloudState = snapshot.State
 		cloudPaired = snapshot.Paired
 	}
@@ -649,6 +738,28 @@ func formatPairCode(code string) string {
 		return code[:3] + " " + code[3:]
 	}
 	return code
+}
+
+// instanceHandover runs while another process holds the single-instance
+// mutex. Each attempt first asks that instance to show its window (signal
+// returns true when it listened), then retries the mutex in case the other
+// instance was only finishing its shutdown (acquire returns true once this
+// process owns it). startup reports that this process should keep starting;
+// signaled reports that the running instance took over. Both false after the
+// last attempt means an instance too old to listen is still running.
+func instanceHandover(signal func() bool, acquire func() bool, attempts int, pause func()) (startup, signaled bool) {
+	for attempt := 0; attempt < attempts; attempt++ {
+		if signal() {
+			return false, true
+		}
+		if acquire() {
+			return true, false
+		}
+		if attempt+1 < attempts && pause != nil {
+			pause()
+		}
+	}
+	return false, false
 }
 
 func hasTrayArgument(arguments []string) bool {

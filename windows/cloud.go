@@ -298,7 +298,7 @@ func (c *cloudClient) startPairingWithMode(force bool) error {
 	publicEncoded := encodeBase64URL(elliptic.Marshal(elliptic.P256(), privateKey.PublicKey.X, privateKey.PublicKey.Y))
 	host, _ := c.app.hostname()
 	var response cloudPairStartResponse
-	status, err := c.doJSON(context.Background(), http.MethodPost, "/v1/pair/start", cloudPairStartRequest{
+	status, err := c.doJSON(c.app.shutdownContext(), http.MethodPost, "/v1/pair/start", cloudPairStartRequest{
 		DeviceName: host,
 		DeviceType: "windows",
 		PublicKey:  publicEncoded,

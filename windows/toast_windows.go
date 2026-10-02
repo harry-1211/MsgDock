@@ -30,6 +30,7 @@ var errNotificationWorkerStopped = errors.New("notification worker is stopped")
 
 type notificationRequest struct {
 	sms    SMS
+	probe  bool // read the notification setting instead of showing a card
 	result chan error
 }
 
@@ -41,6 +42,8 @@ type notificationWorker struct {
 	lifeMu  sync.RWMutex
 	stopped bool
 	push    func(SMS) error
+	probe   func() error // nil means probes succeed without doing anything
+	setup   func() error // runs once on the worker thread before the first request
 	cleanup func()
 }
 
@@ -85,7 +88,7 @@ func (a *App) initializeNotifications() error {
 			ui.handleToastAction(arguments)
 		}
 	})
-	sender := &nativeToastSender{}
+	sender := &nativeToastSender{onSetting: func(disabled bool) { a.notifyDisabled.Store(disabled) }}
 	presenter := &smsNotificationPresenter{push: sender.push, now: time.Now, preview: a.notificationPreview, copyCode: func(sms SMS, code string) {
 		a.mu.RLock()
 		ui := a.ui
@@ -95,6 +98,11 @@ func (a *App) initializeNotifications() error {
 		}
 	}}
 	worker := newNotificationWorker(presenter.deliver)
+	// Register the activation class object now rather than on the first push,
+	// so clicking a card left by a previous run reaches this process instead of
+	// making COM launch a second EXE that only brings the window forward.
+	worker.setup = sender.initialize
+	worker.probe = sender.probeSetting
 	worker.cleanup = sender.close
 	a.mu.Lock()
 	a.notify = worker
@@ -115,10 +123,23 @@ func (worker *notificationWorker) run() {
 			worker.cleanup()
 		}
 	}()
+	if worker.setup != nil {
+		if err := worker.setup(); err != nil {
+			// push retries the initialization, so a late failure is not fatal.
+			log.Printf("prepare Windows notifications failed: %v", err)
+		}
+	}
 	for {
 		select {
 		case request := <-worker.queue:
-			request.result <- worker.push(request.sms)
+			switch {
+			case !request.probe:
+				request.result <- worker.push(request.sms)
+			case worker.probe != nil:
+				request.result <- worker.probe()
+			default:
+				request.result <- nil
+			}
 		case <-worker.stop:
 			for {
 				select {
@@ -133,6 +154,16 @@ func (worker *notificationWorker) run() {
 }
 
 func (worker *notificationWorker) request(sms SMS) error {
+	return worker.submit(notificationRequest{sms: sms})
+}
+
+// probeSetting asks the worker thread to re-read whether Windows shows this
+// app's notifications, without presenting a card.
+func (worker *notificationWorker) probeSetting() error {
+	return worker.submit(notificationRequest{probe: true})
+}
+
+func (worker *notificationWorker) submit(request notificationRequest) error {
 	// Keep the worker alive until this request has received its result. Without
 	// this lifecycle read lock, a request could win the queue send at the same
 	// instant shutdown drains the channel and exits, then wait forever.
@@ -141,10 +172,27 @@ func (worker *notificationWorker) request(sms SMS) error {
 	if worker.stopped {
 		return errNotificationWorkerStopped
 	}
-	result := make(chan error, 1)
-	request := notificationRequest{sms: sms, result: result}
+	request.result = make(chan error, 1)
 	worker.queue <- request
-	return <-result
+	return <-request.result
+}
+
+// probeNotificationSetting refreshes the 关闭了通知 row outside message
+// traffic: at startup, so a muted app is reported before the first SMS, and
+// periodically, so the row clears once the user turns notifications back on.
+func (a *App) probeNotificationSetting() {
+	if a.isClosing() {
+		return
+	}
+	a.mu.RLock()
+	worker := a.notify
+	a.mu.RUnlock()
+	if worker == nil {
+		return
+	}
+	if err := worker.probeSetting(); err != nil && !errors.Is(err, errNotificationWorkerStopped) {
+		log.Printf("read Windows notification setting failed: %v", err)
+	}
 }
 
 func (worker *notificationWorker) shutdown() {

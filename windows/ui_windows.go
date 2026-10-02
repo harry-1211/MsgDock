@@ -88,6 +88,12 @@ type desktopUI struct {
 	previewButtons      map[notificationPreview]*walk.RadioButton
 	relayEdit           *walk.LineEdit
 
+	// status bar: a quiet line that confirms copies and reminds that closing
+	// the window keeps the receiver in the tray
+	statusItem   *walk.StatusBarItem
+	copyNotice   string
+	copyNoticeAt time.Time
+
 	// bookkeeping
 	lastToolTip       string
 	lastTrayLevel     syncLevel
@@ -101,7 +107,16 @@ type desktopUI struct {
 	exiting           bool
 	lastTrayFallback  time.Time
 	lastTrayMessageID string
+	lastSettingProbe  time.Time
 }
+
+const (
+	copyNoticeDuration = 4 * time.Second
+	statusBarIdleText  = "关闭窗口后，MsgDock 继续在托盘接收短信。"
+	// settingProbeInterval paces the read of Windows' notification setting;
+	// each push also refreshes it, so this only covers quiet periods.
+	settingProbeInterval = 30 * time.Second
+)
 
 // smsTableModel backs the recent-SMS table. Rows are newest first, matching
 // App.recent; now is frozen per refresh so the time column is consistent.
@@ -198,6 +213,9 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 		MinSize: Size{Width: 600, Height: 520},
 		Size:    Size{Width: 720, Height: 680},
 		Layout:  VBox{Margins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10}},
+		StatusBarItems: []StatusBarItem{
+			{AssignTo: &ui.statusItem, Text: statusBarIdleText},
+		},
 		Children: []Widget{
 			TabWidget{
 				AssignTo: &ui.tabs,
@@ -250,7 +268,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 								Children: []Widget{
 									Label{
 										AssignTo:  &ui.smsEmpty,
-										Text:      "还没有短信。手机转发的第一条短信会出现在这里，并弹出 Windows 通知。",
+										Text:      emptyInboxText(false),
 										TextColor: colorMuted,
 									},
 									TableView{
@@ -274,7 +292,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 										},
 									},
 									Label{
-										Text:      fmt.Sprintf("双击复制验证码，右键复制全文。显示最近 %d 条；完整记录先写入本地历史，再向手机确认。", historyDisplayLimit),
+										Text:      fmt.Sprintf("双击复制验证码，右键复制全文。显示最近 %d 条；每条先写入本地历史，再向手机确认。", historyDisplayLimit),
 										TextColor: colorFaint,
 									},
 								},
@@ -305,7 +323,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 										},
 									},
 									Label{AssignTo: &ui.lanAddress, TextColor: colorMuted},
-									Label{Text: "手机与电脑在同一 Wi‑Fi 时，在手机端输入这个码即可直连。", TextColor: colorMuted},
+									Label{Text: "手机和电脑连同一个 Wi‑Fi，在手机端“添加接收端”里扫描或输入这个码即可直连。首次运行若 Windows 防火墙询问，请允许专用网络。", TextColor: colorMuted},
 									HSeparator{},
 									Composite{
 										Layout: HBox{MarginsZero: true, Spacing: 12},
@@ -335,7 +353,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 																Text:     "复制",
 																OnClicked: func() {
 																	credentials := app.cloudCredentials()
-																	if app.cloud == nil || !cloudPairingPending(credentials) {
+																	if app.cloudClient() == nil || !cloudPairingPending(credentials) {
 																		walk.MsgBox(ui.window, appName, "请先开始云配对。", walk.MsgBoxIconInformation)
 																		return
 																	}
@@ -533,7 +551,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 										},
 									},
 									Label{
-										Text:      fmt.Sprintf("%s v%s · 关闭窗口后继续在托盘接收 · 历史文件：%s", appName, appVersion, app.historyPath()),
+										Text:      fmt.Sprintf("%s v%s · 历史文件：%s", appName, appVersion, app.historyPath()),
 										TextColor: colorFaint,
 									},
 								},
@@ -561,6 +579,7 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 		}
 		*canceled = true
 		ui.window.Hide()
+		ui.showTrayHintOnce()
 	})
 
 	ui.notifyIcon, err = walk.NewNotifyIcon(ui.window)
@@ -617,7 +636,10 @@ func newDesktopUI(app *App) (*desktopUI, error) {
 	return ui, nil
 }
 
-func (ui *desktopUI) run() {
+// run pumps the message loop until 退出. showEvent (0 when unavailable) is the
+// auto-reset event a second launch sets to bring this window forward; the
+// caller owns its handle.
+func (ui *desktopUI) run(showEvent windows.Handle) {
 	done := make(chan struct{})
 	var refreshWG sync.WaitGroup
 	refreshWG.Add(1)
@@ -639,20 +661,19 @@ func (ui *desktopUI) run() {
 			}
 		}
 	}()
-	if event, err := createShowInstanceEvent(); err != nil {
-		log.Printf("create show-window event failed: %v", err)
-	} else {
+	if showEvent != 0 {
 		refreshWG.Add(1)
 		go func() {
 			defer refreshWG.Done()
-			defer windows.CloseHandle(event)
 			for {
+				// The timeout is only a safety net; shutdown sets the event itself
+				// so this loop ends at once.
+				result, err := windows.WaitForSingleObject(showEvent, 500)
 				select {
 				case <-done:
 					return
 				default:
 				}
-				result, err := windows.WaitForSingleObject(event, 500)
 				if err != nil {
 					log.Printf("wait for show-window event failed: %v", err)
 					return
@@ -671,6 +692,9 @@ func (ui *desktopUI) run() {
 	}
 	ui.window.Run()
 	close(done)
+	if showEvent != 0 {
+		_ = windows.SetEvent(showEvent)
+	}
 	refreshWG.Wait()
 }
 
@@ -728,10 +752,34 @@ func (ui *desktopUI) showStatus() {
 	if ui.window == nil {
 		return
 	}
+	hwnd := uintptr(ui.window.Handle())
+	// A minimized window would stay in the taskbar after Show(); restore it so
+	// a tray click or a second launch always ends with the window in front.
+	if iconic, _, _ := procIsIconic.Call(hwnd); iconic != 0 {
+		_, _, _ = procShowWindow.Call(hwnd, swRestore)
+	}
 	// Show first: refresh() only redraws a visible window.
 	ui.window.Show()
 	ui.refresh()
+	_, _, _ = procSetForegroundWindow.Call(hwnd)
 	_ = ui.window.Activate()
+}
+
+// showTrayHintOnce explains, the first time the window is closed on this
+// installation, that MsgDock keeps running in the tray and where its icon is.
+// Later closes stay silent; the flag is persisted in config.json.
+func (ui *desktopUI) showTrayHintOnce() {
+	if ui.notifyIcon == nil || ui.app.isClosing() || ui.app.trayHintShown() {
+		return
+	}
+	if err := ui.app.markTrayHintShown(); err != nil {
+		log.Printf("persist tray hint flag failed: %v", err)
+		return
+	}
+	if err := ui.notifyIcon.ShowInfo("MsgDock 仍在运行",
+		"窗口已收到托盘，短信照常通知。图标在任务栏右下角，可能收在“^”里；点击图标可重新打开窗口。"); err != nil {
+		log.Printf("tray hint balloon failed: %v", err)
+	}
 }
 
 // openSettings switches to the 设置 tab; focusLogin puts the caret into the
@@ -765,10 +813,11 @@ func (ui *desktopUI) localAddress(now time.Time) string {
 func (ui *desktopUI) status() syncStatus {
 	now := time.Now()
 	in := syncInput{
-		Now:          now,
-		Offline:      ui.localAddress(now) == "0.0.0.0",
-		Sending:      ui.app.isSending(),
-		NotifyFailed: ui.app.notifyFailed.Load(),
+		Now:            now,
+		Offline:        ui.localAddress(now) == "0.0.0.0",
+		Sending:        ui.app.isSending(),
+		NotifyFailed:   ui.app.notifyFailed.Load(),
+		NotifyDisabled: ui.app.notifyDisabled.Load(),
 	}
 	credentials := ui.app.accountCredentials()
 	in.AccountLoggedIn = credentials.SessionToken != ""
@@ -785,8 +834,8 @@ func (ui *desktopUI) status() syncStatus {
 			FailingSince: snapshot.FailingSince,
 		}
 	}
-	if ui.app.cloud != nil {
-		snapshot := ui.app.cloud.snapshot()
+	if cloud := ui.app.cloudClient(); cloud != nil {
+		snapshot := cloud.snapshot()
 		in.CloudPaired = snapshot.Paired
 		in.Cloud = syncPath{
 			Active:       snapshot.Paired,
@@ -800,9 +849,9 @@ func (ui *desktopUI) status() syncStatus {
 	if pending, err := ui.app.pendingNotificationsSnapshot(); err == nil {
 		in.Backlog = pendingBacklogCount(pending)
 	}
-	if recent := ui.app.recentSnapshot(); len(recent) > 0 {
-		in.LastSMSAt = recent[0].ReceivedAt
-		in.LastSMSDevice = recent[0].Device
+	if latest, ok := ui.app.latestSMS(); ok {
+		in.LastSMSAt = latest.ReceivedAt
+		in.LastSMSDevice = latest.Device
 	}
 	return evaluateSyncState(in)
 }
@@ -814,16 +863,24 @@ func (ui *desktopUI) applyTrayState(status syncStatus) {
 		return
 	}
 	if !ui.trayLevelSet || status.Level != ui.lastTrayLevel {
-		if icon := ui.icons.icon(status.Level, trayIconSize, ui.notifyIcon.DPI()); icon != nil {
-			if err := ui.notifyIcon.SetIcon(icon); err != nil {
+		trayIcon := ui.icons.icon(status.Level, trayIconSize, ui.notifyIcon.DPI())
+		windowIcon := ui.icons.icon(status.Level, windowIconSize, 96)
+		if trayIcon == nil && ui.notifyIcon.Icon() == nil {
+			// Rendering failed before any icon was shown: a tray entry without an
+			// icon is invisible, so fall back to the stock application icon.
+			trayIcon = walk.IconApplication()
+			if windowIcon == nil {
+				windowIcon = trayIcon
+			}
+		}
+		if trayIcon != nil {
+			if err := ui.notifyIcon.SetIcon(trayIcon); err != nil {
 				log.Printf("set tray icon failed: %v", err)
 			}
 		}
-		if ui.window != nil {
-			if icon := ui.icons.icon(status.Level, windowIconSize, 96); icon != nil {
-				if err := ui.window.SetIcon(icon); err != nil {
-					log.Printf("set window icon failed: %v", err)
-				}
+		if ui.window != nil && windowIcon != nil {
+			if err := ui.window.SetIcon(windowIcon); err != nil {
+				log.Printf("set window icon failed: %v", err)
 			}
 		}
 		ui.lastTrayLevel = status.Level
@@ -844,6 +901,10 @@ func (ui *desktopUI) refresh() {
 	}
 	status := ui.status()
 	ui.applyTrayState(status)
+	if now := time.Now(); now.Sub(ui.lastSettingProbe) >= settingProbeInterval {
+		ui.lastSettingProbe = now
+		go ui.app.probeNotificationSetting()
+	}
 	// The 1 s ticker keeps running while the window sits in the tray. Hidden
 	// windows only need the tray; skipping the registry read and the table
 	// update saves wakeups and keeps the reader's selection and scroll.
@@ -854,6 +915,20 @@ func (ui *desktopUI) refresh() {
 	ui.refreshSettings()
 	ui.refreshConnections()
 	ui.refreshRecent()
+	ui.refreshStatusItem()
+}
+
+// refreshStatusItem shows the last copy confirmation for a few seconds, then
+// returns to the standing tray reminder.
+func (ui *desktopUI) refreshStatusItem() {
+	if ui.statusItem == nil {
+		return
+	}
+	text := statusBarIdleText
+	if ui.copyNotice != "" && time.Since(ui.copyNoticeAt) < copyNoticeDuration {
+		text = ui.copyNotice
+	}
+	_ = ui.statusItem.SetText(text)
 }
 
 func (ui *desktopUI) refreshStatusBar(status syncStatus) {
@@ -989,10 +1064,10 @@ func (ui *desktopUI) refreshConnections() {
 		ui.cloudCode.SetText(cloudPairCodeText(credentials))
 	}
 	if ui.cloudStatus != nil {
-		if ui.app.cloud == nil {
+		if cloud := ui.app.cloudClient(); cloud == nil {
 			ui.cloudStatus.SetText("云端：尚未启动 · " + cloudPairStatusText(credentials, cloudStatusSnapshot{}))
 		} else {
-			snapshot := ui.app.cloud.snapshot()
+			snapshot := cloud.snapshot()
 			detail := cloudPairStatusText(credentials, snapshot)
 			if snapshot.Paired && snapshot.Backoff > 0 {
 				detail += fmt.Sprintf(" · 每 %s 检查", snapshot.Backoff.Round(time.Second))
@@ -1021,10 +1096,19 @@ func (ui *desktopUI) refreshRecent() {
 	if ui.smsTable == nil || ui.smsModel == nil {
 		return
 	}
+	now := time.Now()
 	recent := ui.app.recentSnapshot()
-	recentKey := fmt.Sprint(len(recent))
+	// The day is part of the key so the time column switches from "15:04" to a
+	// dated form after midnight even when no message arrived.
+	recentKey := fmt.Sprintf("%d|%d", len(recent), now.YearDay())
 	if len(recent) > 0 {
 		recentKey += "|" + recent[0].ID + "|" + fmt.Sprint(recent[0].ReceivedAt) + "|" + recent[len(recent)-1].ID
+	}
+	if len(recent) == 0 && ui.smsEmpty != nil {
+		// Only the empty state depends on whether a remote path exists, so the
+		// text is refreshed outside the key.
+		remote := ui.app.accountCredentials().SessionToken != "" || cloudCredentialsReady(ui.app.cloudCredentials())
+		ui.smsEmpty.SetText(emptyInboxText(remote))
 	}
 	if recentKey == ui.lastRecentKey {
 		return
@@ -1035,7 +1119,7 @@ func (ui *desktopUI) refreshRecent() {
 		selectedID = ui.smsModel.items[index].ID
 	}
 	ui.smsModel.items = recent
-	ui.smsModel.now = time.Now()
+	ui.smsModel.now = now
 	ui.smsModel.PublishRowsReset()
 	if selectedID != "" {
 		for index, sms := range recent {
@@ -1049,6 +1133,16 @@ func (ui *desktopUI) refreshRecent() {
 	if ui.smsEmpty != nil && ui.smsEmpty.Visible() != (len(recent) == 0) {
 		ui.smsEmpty.SetVisible(len(recent) == 0)
 	}
+}
+
+// emptyInboxText is the table's empty state. Without any remote path the
+// only way to get a first message is the LAN pair code shown below, so it
+// says so; otherwise it just explains what will appear here.
+func emptyInboxText(remoteConfigured bool) string {
+	if remoteConfigured {
+		return "还没有短信。手机转发的第一条短信会出现在这里，并弹出 Windows 通知。"
+	}
+	return "还没有短信。先在手机端“添加接收端”里输入下方的局域网配对码；第一条短信会出现在这里，并弹出 Windows 通知。"
 }
 
 // copySelectedSMS copies the OTP of the selected row, or the whole text when
@@ -1122,6 +1216,9 @@ func (ui *desktopUI) runAccountAction(action func(*accountClient) error) {
 	ui.refresh()
 	go func() {
 		err := action(client)
+		if errors.Is(err, context.Canceled) && ui.app.isClosing() {
+			return
+		}
 		ui.stateMu.RLock()
 		window := ui.window
 		ui.stateMu.RUnlock()
@@ -1152,7 +1249,7 @@ func (ui *desktopUI) loginAccount() {
 		return
 	}
 	ui.runAccountAction(func(client *accountClient) error {
-		err := client.login(context.Background(), identifier, password)
+		err := client.login(ui.app.shutdownContext(), identifier, password)
 		if err == nil {
 			ui.clearPassword()
 		}
@@ -1172,7 +1269,7 @@ func (ui *desktopUI) registerAccount() {
 		return
 	}
 	ui.runAccountAction(func(client *accountClient) error {
-		err := client.register(context.Background(), username, email, password)
+		err := client.register(ui.app.shutdownContext(), username, email, password)
 		if err == nil {
 			ui.clearPassword()
 		}
@@ -1201,13 +1298,13 @@ func (ui *desktopUI) logoutAccount() {
 		return
 	}
 	ui.runAccountAction(func(client *accountClient) error {
-		return client.logout(context.Background())
+		return client.logout(ui.app.shutdownContext())
 	})
 }
 
 func (ui *desktopUI) refreshAccountDevices() {
 	ui.runAccountAction(func(client *accountClient) error {
-		return client.refreshDevices(context.Background())
+		return client.refreshDevices(ui.app.shutdownContext())
 	})
 }
 
@@ -1222,12 +1319,13 @@ func (ui *desktopUI) removeAccountDevice() {
 		return
 	}
 	ui.runAccountAction(func(client *accountClient) error {
-		return client.removeDevice(context.Background(), credentials.DeviceID)
+		return client.removeDevice(ui.app.shutdownContext(), credentials.DeviceID)
 	})
 }
 
 func (ui *desktopUI) startCloudPairing() {
-	if ui.app.isClosing() || ui.app.cloud == nil || ui.pairButton == nil {
+	cloud := ui.app.cloudClient()
+	if ui.app.isClosing() || cloud == nil || ui.pairButton == nil {
 		return
 	}
 	credentials := ui.app.cloudCredentials()
@@ -1249,9 +1347,9 @@ func (ui *desktopUI) startCloudPairing() {
 	go func() {
 		var err error
 		if force {
-			err = ui.app.cloud.startPairingForced()
+			err = cloud.startPairingForced()
 		} else {
-			err = ui.app.cloud.startPairing()
+			err = cloud.startPairing()
 		}
 		ui.stateMu.RLock()
 		window := ui.window
@@ -1303,12 +1401,7 @@ func cloudPairStatusText(credentials CloudCredentials, snapshot cloudStatusSnaps
 		}
 		detail := "等待手机确认 · 在手机端输入上面的云配对码"
 		if credentials.PairExpiresAt > 0 {
-			expires := time.Until(time.UnixMilli(credentials.PairExpiresAt))
-			if expires <= 0 {
-				detail += " · 已过期"
-			} else {
-				detail += " · " + expires.Round(time.Second).String() + " 后到期"
-			}
+			detail += " · " + countdownText(time.Until(time.UnixMilli(credentials.PairExpiresAt)))
 		}
 		return detail
 	}
@@ -1376,12 +1469,17 @@ func (ui *desktopUI) handleToastAction(arguments string) {
 	})
 }
 
+// copyText copies on the UI thread. Success is confirmed in the status bar
+// only, never with a dialog or another notification.
 func (ui *desktopUI) copyText(label, value string) {
 	if err := walk.Clipboard().SetText(value); err != nil {
 		log.Printf("copy %s failed: %v", label, err)
 		walk.MsgBox(ui.window, appName, "复制失败："+err.Error(), walk.MsgBoxIconError)
 		return
 	}
+	ui.copyNotice = "已复制" + label
+	ui.copyNoticeAt = time.Now()
+	ui.refreshStatusItem()
 }
 
 // Clipboard access belongs to Walk's GUI thread; copying never opens another
@@ -1418,7 +1516,9 @@ func acquireSingleInstance() (windows.Handle, bool, error) {
 }
 
 func releaseSingleInstance(handle windows.Handle) {
-	_ = windows.CloseHandle(handle)
+	if handle != 0 {
+		_ = windows.CloseHandle(handle)
+	}
 }
 
 // showInstanceEventName is an auto-reset event the running instance waits on.
@@ -1426,11 +1526,20 @@ func releaseSingleInstance(handle windows.Handle) {
 // leaving the user with "already running" and no visible window.
 const showInstanceEventName = singleInstanceName + `.Show`
 
-var procAllowSetForegroundWindow = windows.NewLazySystemDLL("user32.dll").NewProc("AllowSetForegroundWindow")
+var (
+	user32                       = windows.NewLazySystemDLL("user32.dll")
+	procAllowSetForegroundWindow = user32.NewProc("AllowSetForegroundWindow")
+	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
+	procIsIconic                 = user32.NewProc("IsIconic")
+	procShowWindow               = user32.NewProc("ShowWindow")
+)
 
-// signalRunningInstance asks the running instance to show its window. It
-// returns false when that instance is too old to listen (v0.7.6 and earlier).
-func signalRunningInstance() bool {
+const swRestore = 9 // SW_RESTORE
+
+// signalRunningInstance asks the running instance to show its window and
+// reports whether an instance that listens exists; v0.7.6 and earlier have no
+// event. With show false (auto-start) it only checks and leaves the window.
+func signalRunningInstance(show bool) bool {
 	name, err := windows.UTF16PtrFromString(showInstanceEventName)
 	if err != nil {
 		return false
@@ -1440,6 +1549,9 @@ func signalRunningInstance() bool {
 		return false
 	}
 	defer windows.CloseHandle(event)
+	if !show {
+		return true
+	}
 	// Let the running instance take the foreground; ASFW_ANY is (DWORD)-1.
 	_, _, _ = procAllowSetForegroundWindow.Call(uintptr(^uint32(0)))
 	return windows.SetEvent(event) == nil

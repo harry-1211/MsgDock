@@ -29,7 +29,7 @@ final class SyncState {
         }
     }
 
-    enum Action { RELOGIN, GRANT_SMS, ENABLE_NOTIFICATIONS, BATTERY, ADD_ROUTE, DEAD_LETTERS }
+    enum Action { RELOGIN, GRANT_SMS, ENABLE_NOTIFICATIONS, BATTERY, ADD_ROUTE, ENABLE_RECEIVE, DEAD_LETTERS }
 
     /** One needs-action row: a sentence, a button, and for battery an extra guide link. */
     static final class Item {
@@ -88,16 +88,32 @@ final class SyncState {
         final String reason;
         final String recent;
         final List<Item> items;
+        /**
+         * The item the reason line is about, when there is one: its button belongs in
+         * the status card, and the needs-action list shows only the other items so the
+         * same sentence is never printed twice. Null when the reason is about something
+         * else (offline, server unreachable, backlog).
+         */
+        final Item primary;
 
-        Result(Kind kind, String reason, String recent, List<Item> items) {
+        Result(Kind kind, String reason, String recent, List<Item> items, Item primary) {
             this.kind = kind;
             this.reason = reason;
             this.recent = recent;
             this.items = Collections.unmodifiableList(items);
+            this.primary = primary;
         }
 
         String title() { return kind.title; }
         String colorHex() { return kind.colorHex; }
+
+        /** The needs-action rows that still have to be listed under the status card. */
+        List<Item> remainingItems() {
+            if (primary == null) return items;
+            List<Item> rest = new ArrayList<>(items);
+            rest.remove(primary);
+            return Collections.unmodifiableList(rest);
+        }
     }
 
     static final long MIN_THRESHOLD_MS = 30_000L;
@@ -119,8 +135,12 @@ final class SyncState {
         return in.loggedIn || in.lanTargets > 0 || in.cloudSenderLinks > 0;
     }
 
+    /**
+     * A forward target only counts on a device that can receive SMS at all; a tablet
+     * that merely logged in is doing nothing until it also turns receiving on.
+     */
     static boolean hasAnyRoute(Input in) {
-        return hasForwardTarget(in) || in.receiverEnabled || in.cloudReceiverLinks > 0;
+        return (in.canReceiveSms && hasForwardTarget(in)) || in.receiverEnabled || in.cloudReceiverLinks > 0;
     }
 
     static int backlog(Input in) {
@@ -151,7 +171,13 @@ final class SyncState {
             items.add(new Item(Action.BATTERY, "电池优化未豁免，锁屏后短信可能延迟。", "关闭电池优化", true));
         }
         if (!hasAnyRoute(in)) {
-            items.add(new Item(Action.ADD_ROUTE, "还没有任何转发目标或接收来源。", "登录账号或添加接收端", false));
+            if (in.canReceiveSms) {
+                items.add(new Item(Action.ADD_ROUTE, "还没有任何转发目标或接收来源。", "登录账号或添加接收端", false));
+            } else if (in.loggedIn) {
+                items.add(new Item(Action.ENABLE_RECEIVE, "本机没有短信功能，还没有开启接收。", "开启接收", false));
+            } else {
+                items.add(new Item(Action.ADD_ROUTE, "本机没有短信功能，登录账号后可以接收其他手机的短信。", "登录账号", false));
+            }
         }
         if (in.deadLetters > 0) {
             items.add(new Item(Action.DEAD_LETTERS, in.deadLetters + " 条短信多次发送失败", "查看", false));
@@ -164,18 +190,21 @@ final class SyncState {
         int backlog = backlog(in);
         Kind kind;
         String reason;
+        Item primary = null;
         if (!in.online) {
             kind = Kind.BROKEN;
             reason = backlog > 0 ? "没有网络，" + backlog + " 条短信会在联网后自动补发。" : "没有网络，联网后会自动恢复。";
         } else if (in.authRequired) {
             kind = Kind.BROKEN;
             reason = "账号授权已失效，账号同步已暂停。";
+            primary = items.get(0); // always the relogin row
         } else if (unreachable(in)) {
             kind = Kind.BROKEN;
             reason = "服务端连续 " + Math.max(1L, (in.now - in.failingSinceAt) / 60_000L) + " 分钟无法连接，仍在自动重试。";
         } else if (!items.isEmpty()) {
             kind = Kind.ATTENTION;
-            reason = items.get(0).text;
+            primary = items.get(0);
+            reason = primary.text;
         } else if (backlog > 0 && in.inFlight == 0) {
             kind = Kind.DELAYED;
             reason = backlog + " 条短信等待发送，稍后自动重试。";
@@ -189,7 +218,7 @@ final class SyncState {
             kind = Kind.OK;
             reason = okReason(in);
         }
-        return new Result(kind, reason, recentLine(in), items);
+        return new Result(kind, reason, recentLine(in), items, primary);
     }
 
     /** LAN delivery failure is never a needs-action item; it only shows up here. */
@@ -201,7 +230,7 @@ final class SyncState {
         List<String> parts = new ArrayList<>();
         if (forwarding(in)) parts.add("转发到" + routeSummary(in));
         if (in.receiverEnabled) parts.add("接收" + sourceSummary(in));
-        if (parts.isEmpty()) return in.canReceiveSms ? "本机未转发也未接收。" : "本机无短信功能，未开启接收。";
+        if (parts.isEmpty()) return in.canReceiveSms ? "本机未转发也未接收。" : "本机没有短信功能，已停止接收。";
         return join(parts, "；") + "。";
     }
 

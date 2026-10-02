@@ -36,13 +36,14 @@ public class MainActivity extends Activity {
     // Status card and needs-action list
     private View statusDot;
     private TextView statusTitle, statusReason, statusRecent;
-    private Button statusAction;
+    private Button statusAction, statusLink;
     private View issuesCard;
     private LinearLayout issuesContainer;
     private String statusKey = "";
 
     // Recent SMS
     private LinearLayout recentContainer;
+    private View recentHint, recentAll;
     private String recentStamp = "";
 
     // Receivers
@@ -189,10 +190,13 @@ public class MainActivity extends Activity {
         statusReason = findViewById(R.id.text_status_reason);
         statusRecent = findViewById(R.id.text_status_recent);
         statusAction = findViewById(R.id.btn_status_action);
+        statusLink = findViewById(R.id.btn_status_link);
         issuesCard = findViewById(R.id.card_issues);
         issuesContainer = findViewById(R.id.container_issues);
 
         recentContainer = findViewById(R.id.container_recent);
+        recentHint = findViewById(R.id.text_recent_hint);
+        recentAll = findViewById(R.id.btn_account_inbox);
 
         receiversContainer = findViewById(R.id.container_receivers);
         addReceiverContainer = findViewById(R.id.container_add_receiver);
@@ -239,6 +243,7 @@ public class MainActivity extends Activity {
         });
 
         findViewById(R.id.btn_account_inbox).setOnClickListener(v -> showInbox());
+        statusLink.setOnClickListener(v -> openBackgroundGuide());
         findViewById(R.id.btn_scan_lan).setOnClickListener(v -> scanLan());
         findViewById(R.id.btn_manual_add).setOnClickListener(v -> manualAdd());
         findViewById(R.id.btn_cloud_pair_sender).setOnClickListener(v -> cloudPairSender());
@@ -278,8 +283,7 @@ public class MainActivity extends Activity {
         findViewById(R.id.btn_request_sms).setOnClickListener(v ->
             askPermission(Manifest.permission.RECEIVE_SMS, REQUEST_SMS));
         findViewById(R.id.btn_battery_optimize).setOnClickListener(v -> requestBatteryWhitelist());
-        findViewById(R.id.btn_background_guide).setOnClickListener(v ->
-            startActivity(new Intent(this, BackgroundGuideActivity.class)));
+        findViewById(R.id.btn_background_guide).setOnClickListener(v -> openBackgroundGuide());
         findViewById(R.id.btn_app_settings).setOnClickListener(v -> openAppSettings());
         findViewById(R.id.btn_open_shizuku).setOnClickListener(v -> openShizuku());
         findViewById(R.id.btn_copy_adb).setOnClickListener(v -> copyAdbCommands());
@@ -339,21 +343,25 @@ public class MainActivity extends Activity {
         statusReason.setText(state.reason);
         statusRecent.setText(state.recent);
         statusDot.setBackgroundTintList(ColorStateList.valueOf(Color.parseColor(state.colorHex())));
-        statusDot.setContentDescription(state.title());
 
-        if (state.kind == SyncState.Kind.ATTENTION && !state.items.isEmpty()) {
-            SyncState.Item first = state.items.get(0);
+        // The item the reason line describes gets its button here; the list below only
+        // carries the others, so one problem is never shown twice on the first screen.
+        SyncState.Item primary = state.primary;
+        if (primary != null) {
             statusAction.setVisibility(View.VISIBLE);
-            statusAction.setText(first.button);
-            statusAction.setOnClickListener(v -> runAction(first.action));
+            statusAction.setText(primary.button);
+            statusAction.setOnClickListener(v -> runAction(primary.action));
+            statusLink.setVisibility(primary.guideLink ? View.VISIBLE : View.GONE);
         } else {
             statusAction.setVisibility(View.GONE);
             statusAction.setOnClickListener(null);
+            statusLink.setVisibility(View.GONE);
         }
 
         issuesContainer.removeAllViews();
         LayoutInflater inflater = LayoutInflater.from(this);
-        for (SyncState.Item item : state.items) {
+        List<SyncState.Item> remaining = state.remainingItems();
+        for (SyncState.Item item : remaining) {
             View row = inflater.inflate(R.layout.item_issue, issuesContainer, false);
             ((TextView) row.findViewById(R.id.text_issue)).setText(item.text);
             Button action = row.findViewById(R.id.btn_issue_action);
@@ -361,10 +369,14 @@ public class MainActivity extends Activity {
             action.setOnClickListener(v -> runAction(item.action));
             Button link = row.findViewById(R.id.btn_issue_link);
             link.setVisibility(item.guideLink ? View.VISIBLE : View.GONE);
-            if (item.guideLink) link.setOnClickListener(v -> startActivity(new Intent(this, BackgroundGuideActivity.class)));
+            if (item.guideLink) link.setOnClickListener(v -> openBackgroundGuide());
             issuesContainer.addView(row);
         }
-        issuesCard.setVisibility(state.items.isEmpty() ? View.GONE : View.VISIBLE);
+        issuesCard.setVisibility(remaining.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    private void openBackgroundGuide() {
+        startActivity(new Intent(this, BackgroundGuideActivity.class));
     }
 
     /** Every needs-action button reuses an existing flow; nothing new is persisted here. */
@@ -394,12 +406,23 @@ public class MainActivity extends Activity {
                 requestBatteryWhitelist();
                 break;
             case ADD_ROUTE:
+                // Show the two choices side by side: the receivers card with its
+                // "添加接收端" link, and directly under it the open login form. Opening
+                // the add-receiver block too would push the form below the fold, and
+                // focusing a field here would pull the scroll away on IME-eager devices.
                 accountExpanded = true;
-                addReceiverExpanded = true;
                 renderAccount();
-                renderReceivers();
-                scrollTo(R.id.card_receivers);
-                if (!AccountStore.hasAccount(this)) accountUsernameEdit.requestFocus();
+                scrollTo(getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
+                    ? R.id.card_receivers : R.id.card_account); // a tablet only has the login choice
+                break;
+            case ENABLE_RECEIVE:
+                // The checkbox listener saves the flag and starts the service once;
+                // when it is already ticked only the service start is still missing.
+                accountExpanded = true;
+                renderAccount();
+                scrollTo(R.id.card_account);
+                if (accountReceiveCheck.isChecked()) startReceiver();
+                else accountReceiveCheck.setChecked(true);
                 break;
             case DEAD_LETTERS:
                 showDeadLetters();
@@ -449,7 +472,9 @@ public class MainActivity extends Activity {
     private void renderRecentIfChanged() {
         java.io.File file = new java.io.File(getFilesDir(), "cloud-inbox.jsonl");
         String user = AccountStore.userId(this);
-        String stamp = user + "|" + file.length() + "|" + file.lastModified();
+        boolean receiving = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+        // The receiver flag only changes the empty-state wording, but it must still re-render.
+        String stamp = user + "|" + receiving + "|" + file.length() + "|" + file.lastModified();
         if (stamp.equals(recentStamp)) return;
         recentStamp = stamp;
         CloudRelay.executor().execute(() -> {
@@ -465,9 +490,16 @@ public class MainActivity extends Activity {
 
     private void renderRecent(List<org.json.JSONObject> rows, String user) {
         recentContainer.removeAllViews();
+        recentHint.setVisibility(rows.isEmpty() ? View.GONE : View.VISIBLE);
+        recentAll.setVisibility(rows.isEmpty() ? View.GONE : View.VISIBLE);
         if (rows.isEmpty()) {
+            // The local inbox only holds what other devices sent here; a phone that
+            // only forwards must not be told its own SMS will show up in this list.
+            boolean receiving = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
             TextView empty = new TextView(this);
-            empty.setText("还没有收到短信。转发或接收的短信会显示在这里，最新的在最上面。");
+            empty.setText(receiving
+                ? "还没有收到短信。其他设备发来的短信会显示在这里，最新的在最上面。"
+                : "这里只显示其他设备发来的短信；本机最近转发的一条在状态卡里。");
             empty.setTextAppearance(R.style.Text_Body);
             empty.setPadding(0, dp(8), 0, dp(8));
             recentContainer.addView(empty);
@@ -1081,13 +1113,18 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- system shortcuts
 
+    /** Direct whitelist prompt first, then the system list, then app info; never a crash. */
     private void requestBatteryWhitelist() {
         try {
             Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                 Uri.parse("package:" + getPackageName()));
             startActivity(i);
         } catch (Exception e) {
-            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (Exception ignored) {
+                openAppSettings();
+            }
         }
     }
 
