@@ -28,7 +28,7 @@ func TestNotificationBurstReplacesCardWithoutPopupStorm(t *testing.T) {
 	popups, updates, copies := 0, 0, 0
 	lastXML := ""
 	p := &smsNotificationPresenter{now: func() time.Time { return now },
-		push: func(xml string, suppress bool) error {
+		push: func(xml, _ string, suppress bool) error {
 			updates++
 			if !suppress {
 				popups++
@@ -60,7 +60,7 @@ func TestNotificationBurstReplacesCardWithoutPopupStorm(t *testing.T) {
 func TestOldFutureOutOfOrderAndRetryMessagesDoNotStealClipboard(t *testing.T) {
 	now := time.Unix(1800000000, 0)
 	updates, copies := 0, 0
-	p := &smsNotificationPresenter{now: func() time.Time { return now }, push: func(string, bool) error { updates++; return nil }, copyCode: func(SMS, string) { copies++ }}
+	p := &smsNotificationPresenter{now: func() time.Time { return now }, push: func(string, string, bool) error { updates++; return nil }, copyCode: func(SMS, string) { copies++ }}
 	for _, at := range []int64{0, now.Add(-3 * time.Minute).UnixMilli(), now.Add(time.Hour).UnixMilli()} {
 		if err := p.deliver(SMS{ID: "old", Text: "验证码 123456", ReceivedAt: at}); err != nil {
 			t.Fatal(err)
@@ -82,7 +82,7 @@ func TestPresenterFailureRemainsRetryable(t *testing.T) {
 	now := time.Now()
 	fail := true
 	copies := 0
-	p := &smsNotificationPresenter{now: func() time.Time { return now }, push: func(string, bool) error {
+	p := &smsNotificationPresenter{now: func() time.Time { return now }, push: func(string, string, bool) error {
 		if fail {
 			return errors.New("failed")
 		}
@@ -100,7 +100,7 @@ func TestPresenterFailureRemainsRetryable(t *testing.T) {
 
 func TestQuietRecoveryKeepsDurableHistoryAndCrossPathDedup(t *testing.T) {
 	app := &App{dir: t.TempDir(), seenIDs: make(map[string]struct{})}
-	p := &smsNotificationPresenter{now: time.Now, push: func(string, bool) error { t.Fatal("old history should be silent"); return nil }}
+	p := &smsNotificationPresenter{now: time.Now, push: func(string, string, bool) error { t.Fatal("old history should be silent"); return nil }}
 	installTestNotificationWorker(t, app, p.deliver)
 	sms := SMS{ID: "recovery", Text: "验证码 123456", ReceivedAt: time.Now().Add(-time.Hour).UnixMilli()}
 	if err := app.processAccountMessage(sms); err != nil {

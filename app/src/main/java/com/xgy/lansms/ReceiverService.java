@@ -27,6 +27,8 @@ public class ReceiverService extends Service {
     private static volatile String runtimeStatus = "未启动";
     private volatile boolean running;
     private ServerSocket server;
+    // Shared by the account and cloud loops: any setting, network, screen-on or
+    // charger event bumps the version so both loops re-evaluate immediately.
     private final Object accountWake = new Object();
     private long accountWakeVersion;
     private final android.content.SharedPreferences.OnSharedPreferenceChangeListener accountSettings = (prefs, key) -> {
@@ -34,7 +36,21 @@ public class ReceiverService extends Service {
                 || "device_token".equals(key) || "session_token".equals(key)
                 || "auth_required".equals(key)) wakeAccountReceiver();
     };
+    private final android.content.SharedPreferences.OnSharedPreferenceChangeListener cloudSettings = (prefs, key) -> {
+        if (key == null || "cloud_links".equals(key)) wakeAccountReceiver();
+    };
+    private final android.content.BroadcastReceiver powerEvents = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(android.content.Context context, Intent intent) {
+            // The user is looking or the phone is charging: poll now and return to fast pacing.
+            wakeAccountReceiver();
+        }
+    };
+    private boolean powerEventsRegistered;
     private android.net.ConnectivityManager.NetworkCallback accountNetworkCallback;
+    private android.net.Network lastNetwork;
+    private boolean lastNetworkValidated;
+    private String lastServiceText = "";
+    private long lastSavedCloudDelay = -1L;
     private final ExecutorService pool = Executors.newCachedThreadPool();
 
     @Override public void onCreate() {
@@ -45,8 +61,10 @@ public class ReceiverService extends Service {
         startForegroundCompat(code);
         running = true;
         AccountStore.prefs(this).registerOnSharedPreferenceChangeListener(accountSettings);
+        TargetStore.prefs(this).registerOnSharedPreferenceChangeListener(cloudSettings);
         runtimeStatus = "服务已启动，正在开启局域网接收…";
         registerAccountNetworkCallback();
+        registerPowerEvents();
         pool.execute(this::httpLoop);
         pool.execute(this::announceLoop);
         pool.execute(this::cloudLoop);
@@ -79,7 +97,10 @@ public class ReceiverService extends Service {
             runtimeStatus = "未启动";
         }
         unregisterAccountNetworkCallback();
+        unregisterPowerEvents();
+        SyncClock.clearPollDelays();
         AccountStore.prefs(this).unregisterOnSharedPreferenceChangeListener(accountSettings);
+        TargetStore.prefs(this).unregisterOnSharedPreferenceChangeListener(cloudSettings);
         wakeAccountReceiver();
         try { if (server != null) server.close(); } catch (Exception ignored) {}
         pool.shutdownNow();
@@ -197,7 +218,7 @@ public class ReceiverService extends Service {
             }
             if ("GET".equals(method) && "/".equals(path)) {
                 String code = TargetStore.ensurePairCode(this);
-                String html = "<html><meta charset=utf-8><body style='font-family:sans-serif'><h2>MsgDock</h2><p>Android Pad 接收端正在运行</p><p>端口: 58123</p><p>配对码: <b style='font-size:28px'>" + code + "</b></p></body></html>";
+                String html = "<html><meta charset=utf-8><body style='font-family:sans-serif'><h2>MsgDock</h2><p>Android Pad 接收端正在运行</p><p>端口: 58123</p><p>局域网配对码: <b style='font-size:28px'>" + code + "</b></p></body></html>";
                 respond(out, 200, "text/html; charset=utf-8", html.getBytes(StandardCharsets.UTF_8));
                 return;
             }
@@ -209,6 +230,7 @@ public class ReceiverService extends Service {
             byte[] body = readFully(in, len);
             JSONObject j = new JSONObject(new String(body, StandardCharsets.UTF_8));
             if (CloudInboxStore.acceptLan(this, j)) {
+                SyncClock.markReceived(this, j.optString("device", "Phone"));
                 String id = j.optString("id", "");
                 if (id.isEmpty()) {
                     Notifications.showSms(this, j.optString("from", "短信"), j.optString("text", ""), j.optString("device", "Phone"));
@@ -281,6 +303,14 @@ public class ReceiverService extends Service {
 
     private void announceLoop() {
         while (running) {
+            if (LanNet.wifi(this) == null) {
+                // No Wi-Fi means nobody on the LAN can hear the broadcast. Wait for a
+                // network event (bounded, in case Wi-Fi joins without becoming default).
+                long version;
+                synchronized (accountWake) { version = accountWakeVersion; }
+                if (!waitForWake(version, 30_000L)) return;
+                continue;
+            }
             try (DatagramSocket ds = new DatagramSocket()) {
                 LanNet.bindWifi(this, ds);
                 ds.setBroadcast(true);
@@ -290,39 +320,97 @@ public class ReceiverService extends Service {
                 byte[] data = msg.getBytes(StandardCharsets.UTF_8);
                 ds.send(new DatagramPacket(data, data.length, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT));
             } catch (Exception ignored) {}
-            try { Thread.sleep(2200); } catch (InterruptedException e) { return; }
+            try { Thread.sleep(PowerPolicy.announceDelay(PowerPolicy.read(this))); }
+            catch (InterruptedException e) { return; }
         }
     }
 
     private void cloudLoop() {
         long delay = 5000L;
+        int emptyRounds = 0;
         while (running) {
+            long version;
+            synchronized (accountWake) { version = accountWakeVersion; }
             try {
                 int replayed = replayPendingNotifications();
                 CloudRelay.PollResult result = CloudRelay.pollReceivers(this);
                 if (result.linkCount == 0) {
-                    // No cloud receiver means there is nothing to poll. Keep the
-                    // service alive but avoid a needless request every five seconds.
-                    delay = 15_000L;
+                    // No cloud receiver means there is nothing to poll: wait for a
+                    // link/setting/network/screen event instead of waking on a timer.
+                    delay = 0L;
+                    emptyRounds = 0;
                 } else if (result.newMessages > 0 || replayed > 0) {
                     delay = 5000L;
+                    emptyRounds = 0;
                 } else if (!result.success) {
                     delay = Math.min(5L * 60L * 1000L, Math.max(5000L, delay) * 2L);
                 } else {
-                    delay = idleDelay(delay);
+                    emptyRounds++;
+                    delay = Math.max(idleDelay(delay),
+                            PowerPolicy.idlePollDelay(5000L, emptyRounds, PowerPolicy.read(this)));
                 }
             } catch (Exception e) {
-                delay = Math.min(5L * 60L * 1000L, delay * 2L);
+                delay = Math.min(5L * 60L * 1000L, Math.max(5000L, delay) * 2L);
                 android.util.Log.w("XgyLanSms", "Cloud receive poll failed", e);
             }
-            try {
-                android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
-                if (nm != null) nm.notify(58123, Notifications.serviceNotification(this, TargetStore.ensurePairCode(this)));
-            } catch (Exception ignored) {}
-            TargetStore.prefs(this).edit().putLong("cloud_receive_next_delay_ms", delay).apply();
-            try { Thread.sleep(delay); }
-            catch (InterruptedException e) { return; }
+            refreshServiceNotification();
+            SyncClock.setCloudPollDelay(delay); // read-only mirror for the status card
+            if (delay != lastSavedCloudDelay) {
+                TargetStore.prefs(this).edit().putLong("cloud_receive_next_delay_ms", delay).apply();
+                lastSavedCloudDelay = delay;
+            }
+            if (!waitForWake(version, delay)) return;
         }
+    }
+
+    /** Re-posts the ongoing notification only when its text actually changed. */
+    private void refreshServiceNotification() {
+        try {
+            String code = TargetStore.ensurePairCode(this);
+            String text = Notifications.serviceText(this, code);
+            if (text.equals(lastServiceText)) return;
+            android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
+            if (nm != null) nm.notify(58123, Notifications.serviceNotification(this, code));
+            lastServiceText = text;
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Waits for {@code delayMs} (0 = until an event) unless a wake event arrived after
+     * {@code version} was read. Returns false when the service is stopping.
+     */
+    private boolean waitForWake(long version, long delayMs) {
+        synchronized (accountWake) {
+            if (!running) return false;
+            if (version != accountWakeVersion) return true;
+            try { accountWake.wait(delayMs); }
+            catch (InterruptedException e) { return false; }
+            return running;
+        }
+    }
+
+    @android.annotation.SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerPowerEvents() {
+        android.content.IntentFilter filter = new android.content.IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_POWER_CONNECTED);
+        filter.addAction(android.os.PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(powerEvents, filter, android.content.Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(powerEvents, filter);
+            }
+            powerEventsRegistered = true;
+        } catch (RuntimeException e) {
+            android.util.Log.w("XgyLanSms", "亮屏/充电监听注册失败；轮询按原间隔继续", e);
+        }
+    }
+
+    private void unregisterPowerEvents() {
+        if (!powerEventsRegistered) return;
+        try { unregisterReceiver(powerEvents); } catch (RuntimeException ignored) {}
+        powerEventsRegistered = false;
     }
 
     @android.annotation.TargetApi(24)
@@ -332,14 +420,27 @@ public class ReceiverService extends Service {
                 getSystemService(android.net.ConnectivityManager.class);
         if (manager == null) return;
         accountNetworkCallback = new android.net.ConnectivityManager.NetworkCallback() {
+            // Capability callbacks also fire for signal/bandwidth updates. Only a new
+            // default network or one that just became validated is a reason to sync;
+            // anything else would start a network job on every signal change.
             @Override public void onAvailable(android.net.Network network) {
-                triggerAccountSync();
+                if (isNetworkTransition(network, null)) triggerAccountSync();
             }
 
             @Override public void onCapabilitiesChanged(android.net.Network network,
                     android.net.NetworkCapabilities capabilities) {
-                if (capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                    triggerAccountSync();
+                if (!capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return;
+                boolean validated = capabilities.hasCapability(
+                        android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                if (isNetworkTransition(network, validated)) triggerAccountSync();
+            }
+
+            @Override public void onLost(android.net.Network network) {
+                synchronized (accountWake) {
+                    if (network.equals(lastNetwork)) {
+                        lastNetwork = null;
+                        lastNetworkValidated = false;
+                    }
                 }
             }
         };
@@ -363,10 +464,23 @@ public class ReceiverService extends Service {
         }
     }
 
+    /** {@code validated} is null when the callback does not report validation. */
+    private boolean isNetworkTransition(android.net.Network network, Boolean validated) {
+        synchronized (accountWake) {
+            boolean sameNetwork = network.equals(lastNetwork);
+            boolean changed = !sameNetwork || (Boolean.TRUE.equals(validated) && !lastNetworkValidated);
+            lastNetwork = network;
+            if (validated != null) lastNetworkValidated = validated;
+            else if (!sameNetwork) lastNetworkValidated = false;
+            return changed;
+        }
+    }
+
     private void triggerAccountSync() {
         wakeAccountReceiver();
         AccountApi.scheduleOutboxFlush(this);
-        CloudSyncJobService.schedule(this);
+        // Only queue a network job when something is actually waiting to upload.
+        CloudSyncJobService.scheduleIfPending(this);
         android.content.Context app = getApplicationContext();
         CloudRelay.executor().execute(() -> AccountApi.flushOutbox(app));
     }
@@ -401,6 +515,7 @@ public class ReceiverService extends Service {
 
     private void accountLoop() {
         long delay = 3000L;
+        int emptyRounds = 0;
         while (running) {
             long version;
             synchronized (accountWake) { version = accountWakeVersion; }
@@ -408,11 +523,20 @@ public class ReceiverService extends Service {
                     && !AccountStore.authRequired(this);
             if (enabled) {
                 boolean success = AccountApi.pollInbox(this);
-                replayPendingNotifications();
-                delay = success ? 3000L : Math.min(300_000L, Math.max(3000L, delay) * 2L);
+                int replayed = replayPendingNotifications();
+                if (!success) {
+                    delay = Math.min(300_000L, Math.max(3000L, delay) * 2L);
+                } else {
+                    // 3 s while the screen is on, charging, or messages are flowing;
+                    // relaxed only after a quiet stretch on battery with the screen off.
+                    emptyRounds = replayed > 0 ? 0 : emptyRounds + 1;
+                    delay = PowerPolicy.idlePollDelay(3000L, emptyRounds, PowerPolicy.read(this));
+                }
             } else {
                 delay = 3000L;
+                emptyRounds = 0;
             }
+            SyncClock.setAccountPollDelay(enabled ? delay : 0L); // read-only mirror for the status card
             synchronized (accountWake) {
                 if (!running) return;
                 // Guard against a setting/network change between the check and

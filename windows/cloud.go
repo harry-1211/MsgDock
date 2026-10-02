@@ -93,7 +93,8 @@ type cloudStatusSnapshot struct {
 	PairExpiresAt int64
 	LastPairCode  string
 	PairedAt      int64
-	LastPoll      time.Time
+	LastPoll      time.Time // last successful message poll; seeded with the start time when paired
+	FailingSince  time.Time // first failure of the current streak; zero when the last poll succeeded
 	Backoff       time.Duration
 	Paired        bool
 }
@@ -112,6 +113,10 @@ type cloudClient struct {
 func newCloudClient(app *App) *cloudClient {
 	creds := app.cloudCredentials()
 	state := cloudPairingState(creds)
+	var lastPoll time.Time
+	if cloudCredentialsReady(creds) {
+		lastPoll = time.Now()
+	}
 	return &cloudClient{
 		app:        app,
 		httpClient: &http.Client{Timeout: 15 * time.Second},
@@ -120,8 +125,9 @@ func newCloudClient(app *App) *cloudClient {
 		state: cloudStatusSnapshot{
 			State: state, PairCode: creds.PairCode, PairExpiresAt: creds.PairExpiresAt,
 			LastPairCode: creds.LastPairCode, PairedAt: creds.PairedAt,
-			Backoff: cloudPollInterval,
-			Paired:  cloudCredentialsReady(creds),
+			LastPoll: lastPoll,
+			Backoff:  cloudPollInterval,
+			Paired:   cloudCredentialsReady(creds),
 		},
 	}
 }
@@ -217,8 +223,16 @@ func (c *cloudClient) setState(state, detail, code string, backoff time.Duration
 	c.state.PairedAt = creds.PairedAt
 	c.state.Backoff = backoff
 	c.state.Paired = cloudCredentialsReady(creds)
-	if state == "已连接" {
+	switch state {
+	case "已连接":
 		c.state.LastPoll = time.Now()
+		c.state.FailingSince = time.Time{}
+	case "连接失败":
+		if c.state.FailingSince.IsZero() {
+			c.state.FailingSince = time.Now()
+		}
+	default:
+		c.state.FailingSince = time.Time{}
 	}
 	c.stateMu.Unlock()
 }
@@ -284,7 +298,7 @@ func (c *cloudClient) startPairingWithMode(force bool) error {
 	publicEncoded := encodeBase64URL(elliptic.Marshal(elliptic.P256(), privateKey.PublicKey.X, privateKey.PublicKey.Y))
 	host, _ := c.app.hostname()
 	var response cloudPairStartResponse
-	status, err := c.doJSON(context.Background(), http.MethodPost, "/v1/pair/start", cloudPairStartRequest{
+	status, err := c.doJSON(c.app.shutdownContext(), http.MethodPost, "/v1/pair/start", cloudPairStartRequest{
 		DeviceName: host,
 		DeviceType: "windows",
 		PublicKey:  publicEncoded,
@@ -440,6 +454,10 @@ func (c *cloudClient) pollMessagesWithCount(ctx context.Context, creds CloudCred
 	messages, err := decodeEnvelopeList(raw)
 	if err != nil {
 		return 0, err
+	}
+	if len(messages) > 0 {
+		c.app.beginSending()
+		defer c.app.endSending()
 	}
 	ackIDs := make([]string, 0, len(messages))
 	var firstErr error

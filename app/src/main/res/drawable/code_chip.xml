@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Verification-code chip on a recent-SMS row; the row itself handles the tap. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@color/surface_04"/>
+    <stroke android:width="1dp" android:color="@color/divider"/>
+    <corners android:radius="@dimen/radius_sm"/>
+</shape>

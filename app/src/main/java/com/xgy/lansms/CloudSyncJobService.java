@@ -11,6 +11,10 @@ import android.content.Context;
 public class CloudSyncJobService extends JobService {
     private static final int PERIODIC_JOB_ID = 5812301;
     private static final int IMMEDIATE_JOB_ID = 5812302;
+    /** Retries and receiver catch-up while there is real work to do. */
+    static final long BUSY_PERIOD_MS = 15L * 60L * 1000L;
+    /** Only the occasional device-backup check remains when nothing is pending. */
+    static final long IDLE_PERIOD_MS = 6L * 60L * 60L * 1000L;
 
     @Override public boolean onStartJob(JobParameters params) {
         CloudRelay.executor().execute(() -> {
@@ -40,7 +44,11 @@ public class CloudSyncJobService extends JobService {
             } catch (RuntimeException ignored) {
                 // A transient worker failure must use JobScheduler's configured
                 // exponential backoff instead of being marked complete.
-            } finally { jobFinished(params, needsReschedule); }
+            } finally {
+                jobFinished(params, needsReschedule);
+                // Safe only after jobFinished: re-scheduling a running job's id stops it.
+                if (!needsReschedule) refreshPeriodic(getApplicationContext());
+            }
         });
         return true;
     }
@@ -64,18 +72,58 @@ public class CloudSyncJobService extends JobService {
                 || (accountAvailable && (!accountSyncSuccess || pendingAccountOutboxCount != 0));
     }
 
-    public static void schedule(Context context) {
+    static long periodFor(boolean hasPendingWork) {
+        return hasPendingWork ? BUSY_PERIOD_MS : IDLE_PERIOD_MS;
+    }
+
+    /** Durable outbox entries or Android-side receiving keep the 15-minute fallback. */
+    static boolean hasPendingWork(Context app) {
+        if (CloudOutboxStore.count(app) != 0) return true;
+        if (AccountStore.hasAccount(app) && AccountOutboxStore.count(app) != 0) return true;
+        return AccountStore.receiveEnabled(app)
+                && TargetStore.prefs(app).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+    }
+
+    /**
+     * Network-change entry point: queue the immediate job only when an outbox has
+     * entries, otherwise just keep the periodic fallback at the right interval.
+     */
+    public static void scheduleIfPending(Context context) {
+        Context app = context.getApplicationContext();
+        if (CloudOutboxStore.count(app) != 0
+                || (AccountStore.hasAccount(app) && AccountOutboxStore.count(app) != 0)) {
+            schedule(app);
+        } else {
+            refreshPeriodic(app);
+        }
+    }
+
+    /** Keeps an existing periodic job's timer unless its interval must change. */
+    static void refreshPeriodic(Context context) {
         Context app = context.getApplicationContext();
         JobScheduler scheduler = (JobScheduler) app.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         if (scheduler == null) return;
         try {
-            ComponentName component = new ComponentName(app, CloudSyncJobService.class);
-            JobInfo periodic = new JobInfo.Builder(PERIODIC_JOB_ID, component)
+            long period = periodFor(hasPendingWork(app));
+            JobInfo current = scheduler.getPendingJob(PERIODIC_JOB_ID);
+            if (current != null && current.isPeriodic() && current.getIntervalMillis() == period) return;
+            scheduler.schedule(new JobInfo.Builder(PERIODIC_JOB_ID, new ComponentName(app, CloudSyncJobService.class))
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                    .setPeriodic(15L * 60L * 1000L)
+                    .setPeriodic(period)
                     .setPersisted(true)
-                    .build();
-            scheduler.schedule(periodic);
+                    .build());
+        } catch (RuntimeException e) {
+            android.util.Log.w("MsgDock", "周期同步任务安排失败", e);
+        }
+    }
+
+    public static void schedule(Context context) {
+        Context app = context.getApplicationContext();
+        JobScheduler scheduler = (JobScheduler) app.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (scheduler == null) return;
+        refreshPeriodic(app);
+        try {
+            ComponentName component = new ComponentName(app, CloudSyncJobService.class);
             JobInfo immediate = new JobInfo.Builder(IMMEDIATE_JOB_ID, component)
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setMinimumLatency(0L)

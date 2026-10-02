@@ -8,7 +8,7 @@
     <color name="surface_04">#1B2A32</color>
     <color name="surface_05">#21323C</color>
 
-    <!-- Accent — luminous cyan for messaging/connectivity -->
+    <!-- Accent — luminous cyan, reserved for primary buttons and links -->
     <color name="accent_primary">#38BDF8</color>
     <color name="accent_primary_dim">#1E88B8</color>
     <color name="accent_primary_bright">#60D5FF</color>
@@ -18,13 +18,24 @@
     <color name="accent_warning">#F59E0B</color>
     <color name="accent_error">#EF4444</color>
 
-    <!-- Text hierarchy -->
-    <color name="text_primary">#F8FAFC</color>
+    <!-- Sync states (DESIGN.md "同步状态模型"); SyncState.Kind is the source of truth -->
+    <color name="state_broken">#F87171</color>
+    <color name="state_attention">#94A3B8</color>
+    <color name="state_delayed">#FBBF24</color>
+    <color name="state_syncing">#38BDF8</color>
+    <color name="state_ok">#34D399</color>
+
+    <!-- Text hierarchy: title / body / caption -->
+    <color name="text_primary">#FFFFFF</color>
     <color name="text_secondary">#CBD5E1</color>
     <color name="text_tertiary">#94A3B8</color>
     <color name="text_disabled">#64748B</color>
 
     <!-- Semantic -->
     <color name="divider">#1E293B</color>
+    <!-- Strokes that must read as an edge on a card (outlined buttons, inputs); the divider is too close to the surfaces. -->
+    <color name="outline">#3B4D61</color>
     <color name="overlay_scrim">#CC000000</color>
+    <color name="ripple_light">#33FFFFFF</color>
+    <color name="ripple_dark">#33000000</color>
 </resources>

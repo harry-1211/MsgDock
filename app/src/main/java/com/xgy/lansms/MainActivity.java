@@ -4,6 +4,8 @@ import android.Manifest;
 import android.app.*;
 import android.content.*;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.*;
 import android.provider.Settings;
@@ -15,51 +17,91 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
+/**
+ * Status-first home screen (DESIGN.md "状态优先的界面"). One Activity, one ScrollView,
+ * sections in a fixed order; every collapse is visibility only and lives in the
+ * instance state. All sync logic stays in the stores and services; this class only
+ * gathers facts for {@link SyncState} and renders the result.
+ */
 public class MainActivity extends Activity {
     private static final int REQUEST_SMS = 10;
     private static final int REQUEST_NOTIFICATIONS = 11;
     private static final int REQUEST_NEARBY = 12;
     private static final int REQUEST_SCAN = 13;
+    private static final int RECENT_ROWS = 5;
     private int pendingPermission;
     private boolean scanning;
     private Thread scanThread;
-    // UI references
-    private TextView relayUrlEdit;
-    private TextView cloudStatusText, machineCodeText, backupStatusText;
-    private TextView smsPermissionText, nearbyPermissionText, receiverStatusText;
+
+    // Status card and needs-action list
+    private View statusDot;
+    private TextView statusTitle, statusReason, statusRecent;
+    private Button statusAction, statusLink;
+    private View issuesCard;
+    private LinearLayout issuesContainer;
+    private String statusKey = "";
+
+    // Recent SMS
+    private LinearLayout recentContainer;
+    private View recentHint, recentAll;
+    private String recentStamp = "";
+
+    // Receivers
+    private LinearLayout receiversContainer;
+    private View addReceiverContainer, nearbyPermissionRow;
+    private Button addReceiverToggle;
+    private TextView nearbyPermissionText;
+    private boolean addReceiverExpanded;
+
+    // Account
     private TextView accountStatusText;
+    private Button accountToggle;
+    private View accountBody, loginGroup, sessionGroup;
     private EditText accountUsernameEdit, accountEmailEdit, accountPasswordEdit;
     private CheckBox accountReceiveCheck;
-    private final Handler accountUiHandler = new Handler(Looper.getMainLooper());
-    private final Runnable accountUiRefresh = new Runnable() {
+    private boolean accountExpanded;
+
+    // Advanced
+    private View advancedContainer;
+    private Button advancedToggle;
+    private TextView relayUrlEdit, machineCodeText, backupStatusText, smsPermissionText, receiverStatusText;
+    private TextView detailReceiverText, cloudStatusText, accountDetailText;
+    private boolean advancedExpanded;
+
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private final Runnable periodicRefresh = new Runnable() {
         @Override public void run() {
             if (!activityAlive()) return;
-            accountStatusText.setText(AccountApi.statusText(MainActivity.this));
-            receiverStatusText.setText(receiverStatus());
-            accountUiHandler.postDelayed(this, 3000L);
+            renderAccount();
+            renderStatus();
+            renderRecentIfChanged();
+            if (advancedExpanded) renderDetails();
+            uiHandler.postDelayed(this, 3000L);
         }
     };
-    private LinearLayout cloudLinksContainer, targetsContainer;
-    private Button cloudPairSenderBtn, cloudPairReceiverBtn;
-    private View nearbyPermissionRow;
 
     private final List<TargetStore.Target> discovered = Collections.synchronizedList(new ArrayList<>());
 
     @Override public void onCreate(Bundle b) {
         super.onCreate(b);
-        if (b != null) pendingPermission = b.getInt("pending_permission", 0);
+        if (b != null) {
+            pendingPermission = b.getInt("pending_permission", 0);
+            advancedExpanded = b.getBoolean("advanced_expanded", false);
+            accountExpanded = b.getBoolean("account_expanded", false);
+            addReceiverExpanded = b.getBoolean("add_receiver_expanded", false);
+        }
         setContentView(R.layout.activity_main);
         WindowLayout.apply(this);
-        
+
         Notifications.ensureChannels(this);
         ReceiverService.migrateReceiverEnabled(this);
         ReceiverService.ensureStarted(this);
         CloudSyncJobService.schedule(this);
-        
+
         initViews();
         setupListeners();
         render();
-        
+
         DeviceBackupManager.onAppStarted(this, (success, message) -> {
             if (!activityAlive()) return;
             if (!success && message != null && message.contains("重新登记")) {
@@ -73,20 +115,24 @@ public class MainActivity extends Activity {
         super.onResume();
         ReceiverService.ensureStarted(this);
         render();
-        accountUiHandler.post(accountUiRefresh);
+        uiHandler.post(periodicRefresh);
     }
 
     @Override protected void onPause() {
-        accountUiHandler.removeCallbacks(accountUiRefresh);
+        uiHandler.removeCallbacks(periodicRefresh);
         super.onPause();
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("pending_permission", pendingPermission);
+        state.putBoolean("advanced_expanded", advancedExpanded);
+        state.putBoolean("account_expanded", accountExpanded);
+        state.putBoolean("add_receiver_expanded", addReceiverExpanded);
         super.onSaveInstanceState(state);
     }
 
     @Override protected void onDestroy() {
+        uiHandler.removeCallbacks(periodicRefresh);
         if (scanThread != null) scanThread.interrupt();
         super.onDestroy();
     }
@@ -139,52 +185,71 @@ public class MainActivity extends Activity {
     }
 
     private void initViews() {
-        relayUrlEdit = findViewById(R.id.edit_relay_url);
-        cloudStatusText = findViewById(R.id.text_cloud_status);
-        machineCodeText = findViewById(R.id.text_machine_code);
-        backupStatusText = findViewById(R.id.text_backup_status);
-        smsPermissionText = findViewById(R.id.text_sms_permission);
+        statusDot = findViewById(R.id.view_status_dot);
+        statusTitle = findViewById(R.id.text_status_title);
+        statusReason = findViewById(R.id.text_status_reason);
+        statusRecent = findViewById(R.id.text_status_recent);
+        statusAction = findViewById(R.id.btn_status_action);
+        statusLink = findViewById(R.id.btn_status_link);
+        issuesCard = findViewById(R.id.card_issues);
+        issuesContainer = findViewById(R.id.container_issues);
+
+        recentContainer = findViewById(R.id.container_recent);
+        recentHint = findViewById(R.id.text_recent_hint);
+        recentAll = findViewById(R.id.btn_account_inbox);
+
+        receiversContainer = findViewById(R.id.container_receivers);
+        addReceiverContainer = findViewById(R.id.container_add_receiver);
+        addReceiverToggle = findViewById(R.id.btn_toggle_add_receiver);
+        nearbyPermissionRow = findViewById(R.id.row_nearby_permission);
         nearbyPermissionText = findViewById(R.id.text_nearby_permission);
-        receiverStatusText = findViewById(R.id.text_receiver_status);
+
         accountStatusText = findViewById(R.id.text_account_status);
+        accountToggle = findViewById(R.id.btn_toggle_account);
+        accountBody = findViewById(R.id.container_account_body);
+        loginGroup = findViewById(R.id.group_account_login);
+        sessionGroup = findViewById(R.id.group_account_session);
         accountUsernameEdit = findViewById(R.id.edit_account_username);
         accountEmailEdit = findViewById(R.id.edit_account_email);
         accountPasswordEdit = findViewById(R.id.edit_account_password);
         accountReceiveCheck = findViewById(R.id.check_account_receive);
         accountReceiveCheck.setChecked(AccountStore.receiveEnabled(this));
-        cloudLinksContainer = findViewById(R.id.container_cloud_links);
-        targetsContainer = findViewById(R.id.container_targets);
-        cloudPairSenderBtn = findViewById(R.id.btn_cloud_pair_sender);
-        cloudPairReceiverBtn = findViewById(R.id.btn_cloud_pair_receiver);
-        nearbyPermissionRow = findViewById(R.id.row_nearby_permission);
+
+        advancedContainer = findViewById(R.id.container_advanced);
+        advancedToggle = findViewById(R.id.btn_toggle_advanced);
+        relayUrlEdit = findViewById(R.id.edit_relay_url);
+        machineCodeText = findViewById(R.id.text_machine_code);
+        backupStatusText = findViewById(R.id.text_backup_status);
+        smsPermissionText = findViewById(R.id.text_sms_permission);
+        receiverStatusText = findViewById(R.id.text_receiver_status);
+        detailReceiverText = findViewById(R.id.text_detail_receiver);
+        cloudStatusText = findViewById(R.id.text_cloud_status);
+        accountDetailText = findViewById(R.id.text_account_detail);
     }
 
     private void setupListeners() {
-        findViewById(R.id.btn_background_guide).setOnClickListener(v ->
-            startActivity(new Intent(this, BackgroundGuideActivity.class)));
-        cloudPairSenderBtn.setOnClickListener(v -> cloudPairSender());
-        cloudPairReceiverBtn.setOnClickListener(v -> cloudPairReceiver());
-        
-        findViewById(R.id.btn_copy_machine_code).setOnClickListener(v -> copyMachineCode());
-        findViewById(R.id.btn_sync_recover).setOnClickListener(v -> syncOrRecover());
-        findViewById(R.id.btn_delete_device).setOnClickListener(v -> confirmDeleteDevice());
-        
-        findViewById(R.id.btn_request_sms).setOnClickListener(v -> 
-            askPermission(Manifest.permission.RECEIVE_SMS, REQUEST_SMS));
-        findViewById(R.id.btn_request_nearby).setOnClickListener(v -> 
-            askPermission(Manifest.permission.NEARBY_WIFI_DEVICES, REQUEST_NEARBY));
-        
+        addReceiverToggle.setOnClickListener(v -> {
+            addReceiverExpanded = !addReceiverExpanded;
+            renderReceivers();
+        });
+        accountToggle.setOnClickListener(v -> {
+            accountExpanded = !accountExpanded;
+            renderAccount();
+            if (accountExpanded && !AccountStore.hasAccount(this)) accountUsernameEdit.requestFocus();
+        });
+        advancedToggle.setOnClickListener(v -> {
+            advancedExpanded = !advancedExpanded;
+            renderAdvanced();
+        });
+
+        findViewById(R.id.btn_account_inbox).setOnClickListener(v -> showInbox());
+        statusLink.setOnClickListener(v -> openBackgroundGuide());
         findViewById(R.id.btn_scan_lan).setOnClickListener(v -> scanLan());
         findViewById(R.id.btn_manual_add).setOnClickListener(v -> manualAdd());
+        findViewById(R.id.btn_cloud_pair_sender).setOnClickListener(v -> cloudPairSender());
         findViewById(R.id.btn_send_test).setOnClickListener(v -> sendTest());
-        
-        findViewById(R.id.btn_start_receiver).setOnClickListener(v -> startReceiver());
-        findViewById(R.id.btn_stop_receiver).setOnClickListener(v -> stopReceiver());
-        
-        findViewById(R.id.btn_battery_optimize).setOnClickListener(v -> requestBatteryWhitelist());
-        findViewById(R.id.btn_app_settings).setOnClickListener(v -> openAppSettings());
-        findViewById(R.id.btn_open_shizuku).setOnClickListener(v -> openShizuku());
-        findViewById(R.id.btn_copy_adb).setOnClickListener(v -> copyAdbCommands());
+        findViewById(R.id.btn_request_nearby).setOnClickListener(v ->
+            askPermission(Manifest.permission.NEARBY_WIFI_DEVICES, REQUEST_NEARBY));
 
         findViewById(R.id.btn_account_login).setOnClickListener(v -> accountLogin());
         findViewById(R.id.btn_account_register).setOnClickListener(v -> accountRegister());
@@ -194,7 +259,6 @@ public class MainActivity extends Activity {
             if (enabled && AccountStore.hasAccount(this)) startReceiver();
             render();
         });
-        findViewById(R.id.btn_account_inbox).setOnClickListener(v -> showInbox());
         findViewById(R.id.btn_account_refresh).setOnClickListener(v -> {
             if (!AccountStore.hasAccount(this)) { Toast.makeText(this, "请先登录账号", Toast.LENGTH_SHORT).show(); return; }
             if (accountReceiveCheck.isChecked()) startReceiver();
@@ -209,118 +273,412 @@ public class MainActivity extends Activity {
                 });
             });
         });
+
+        findViewById(R.id.btn_cloud_pair_receiver).setOnClickListener(v -> cloudPairReceiver());
+        findViewById(R.id.btn_copy_machine_code).setOnClickListener(v -> copyMachineCode());
+        findViewById(R.id.btn_sync_recover).setOnClickListener(v -> syncOrRecover());
+        findViewById(R.id.btn_delete_device).setOnClickListener(v -> confirmDeleteDevice());
+        findViewById(R.id.btn_start_receiver).setOnClickListener(v -> startReceiver());
+        findViewById(R.id.btn_stop_receiver).setOnClickListener(v -> stopReceiver());
+        findViewById(R.id.btn_request_sms).setOnClickListener(v ->
+            askPermission(Manifest.permission.RECEIVE_SMS, REQUEST_SMS));
+        findViewById(R.id.btn_battery_optimize).setOnClickListener(v -> requestBatteryWhitelist());
+        findViewById(R.id.btn_background_guide).setOnClickListener(v -> openBackgroundGuide());
+        findViewById(R.id.btn_app_settings).setOnClickListener(v -> openAppSettings());
+        findViewById(R.id.btn_open_shizuku).setOnClickListener(v -> openShizuku());
+        findViewById(R.id.btn_copy_adb).setOnClickListener(v -> copyAdbCommands());
     }
 
     private void render() {
-        // Cloud relay
-        relayUrlEdit.setText(RelayHttp.PRIMARY);
-        ((TextView) findViewById(R.id.text_backup_relay_url)).setText(RelayHttp.BACKUP);
-        cloudStatusText.setText(CloudRelay.statusText(this));
-        
-        // Device management
-        machineCodeText.setText(DeviceBackupManager.machineCode(this));
-        backupStatusText.setText(DeviceBackupManager.statusText(this));
-        renderCloudLinks();
-        
-        // Permissions
-        boolean sms = checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
-        smsPermissionText.setText("短信权限：" + (sms ? "✓ 已允许" : "✗ 未允许"));
-        
+        renderStatus();
+        renderRecentIfChanged();
+        renderReceivers();
+        renderAccount();
+        renderAdvanced();
+    }
+
+    // ---------------------------------------------------------------- status card
+
+    private SyncState.Input stateInput() {
+        SyncState.Input in = new SyncState.Input();
+        in.now = System.currentTimeMillis();
+        in.online = CloudRelay.hasNetwork(this);
+        in.loggedIn = AccountStore.hasAccount(this);
+        in.authRequired = in.loggedIn && AccountStore.authRequired(this);
+        in.failingSinceAt = SyncClock.failingSince();
+        in.canReceiveSms = getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEPHONY);
+        in.smsPermission = checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
+        NotificationManager notifications = getSystemService(NotificationManager.class);
+        in.notificationsEnabled = notifications == null || notifications.areNotificationsEnabled();
+        PowerManager power = getSystemService(PowerManager.class);
+        in.batteryExempt = power == null || power.isIgnoringBatteryOptimizations(getPackageName());
+        in.accountReceive = AccountStore.receiveEnabled(this);
+        in.receiverEnabled = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+        in.lanTargets = TargetStore.load(this).size();
+        in.cloudSenderLinks = CloudConfigStore.senderLinks(this).size();
+        in.cloudReceiverLinks = CloudConfigStore.receiverLinks(this).size();
+        in.deadLetters = Math.max(0, CloudOutboxStore.deadLetterCount(this));
+        in.accountPending = in.loggedIn ? AccountOutboxStore.count(this) : 0;
+        in.legacyPending = CloudOutboxStore.count(this);
+        in.inFlight = SyncClock.inFlight();
+        in.pollIntervalMs = SyncClock.pollIntervalMs();
+        in.lastSuccessAt = SyncClock.lastSuccess(this);
+        in.lanProblem = SyncClock.lanProblem(this);
+        in.lastForwardedAt = SyncClock.lastForwardedAt(this);
+        in.lastForwardedTo = SyncClock.lastForwardedTo(this);
+        in.lastReceivedAt = SyncClock.lastReceivedAt(this);
+        in.lastReceivedFrom = SyncClock.lastReceivedFrom(this);
+        return in;
+    }
+
+    private void renderStatus() {
+        SyncState.Result state = SyncState.evaluate(stateInput());
+        StringBuilder key = new StringBuilder(state.kind.name()).append('|').append(state.reason).append('|').append(state.recent);
+        for (SyncState.Item item : state.items) key.append('|').append(item.text);
+        // Rebuilding rows every 3 s would steal focus and ripples from the buttons; skip when unchanged.
+        if (key.toString().equals(statusKey)) return;
+        statusKey = key.toString();
+
+        statusTitle.setText(state.title());
+        statusReason.setText(state.reason);
+        statusRecent.setText(state.recent);
+        statusDot.setBackgroundTintList(ColorStateList.valueOf(Color.parseColor(state.colorHex())));
+
+        // The item the reason line describes gets its button here; the list below only
+        // carries the others, so one problem is never shown twice on the first screen.
+        SyncState.Item primary = state.primary;
+        if (primary != null) {
+            statusAction.setVisibility(View.VISIBLE);
+            statusAction.setText(primary.button);
+            statusAction.setOnClickListener(v -> runAction(primary.action));
+            statusLink.setVisibility(primary.guideLink ? View.VISIBLE : View.GONE);
+        } else {
+            statusAction.setVisibility(View.GONE);
+            statusAction.setOnClickListener(null);
+            statusLink.setVisibility(View.GONE);
+        }
+
+        issuesContainer.removeAllViews();
+        LayoutInflater inflater = LayoutInflater.from(this);
+        List<SyncState.Item> remaining = state.remainingItems();
+        for (SyncState.Item item : remaining) {
+            View row = inflater.inflate(R.layout.item_issue, issuesContainer, false);
+            ((TextView) row.findViewById(R.id.text_issue)).setText(item.text);
+            Button action = row.findViewById(R.id.btn_issue_action);
+            action.setText(item.button);
+            action.setOnClickListener(v -> runAction(item.action));
+            Button link = row.findViewById(R.id.btn_issue_link);
+            link.setVisibility(item.guideLink ? View.VISIBLE : View.GONE);
+            if (item.guideLink) link.setOnClickListener(v -> openBackgroundGuide());
+            issuesContainer.addView(row);
+        }
+        issuesCard.setVisibility(remaining.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    private void openBackgroundGuide() {
+        startActivity(new Intent(this, BackgroundGuideActivity.class));
+    }
+
+    /** Every needs-action button reuses an existing flow; nothing new is persisted here. */
+    private void runAction(SyncState.Action action) {
+        switch (action) {
+            case RELOGIN:
+                accountExpanded = true;
+                renderAccount();
+                scrollTo(R.id.card_account);
+                accountPasswordEdit.requestFocus();
+                break;
+            case GRANT_SMS:
+                askPermission(Manifest.permission.RECEIVE_SMS, REQUEST_SMS);
+                break;
+            case ENABLE_NOTIFICATIONS:
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED && shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+                    askPermission(Manifest.permission.POST_NOTIFICATIONS, REQUEST_NOTIFICATIONS);
+                } else {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+                    } catch (ActivityNotFoundException e) { openAppSettings(); }
+                }
+                break;
+            case BATTERY:
+                requestBatteryWhitelist();
+                break;
+            case ADD_ROUTE:
+                // Show the two choices side by side: the receivers card with its
+                // "添加接收端" link, and directly under it the open login form. Opening
+                // the add-receiver block too would push the form below the fold, and
+                // focusing a field here would pull the scroll away on IME-eager devices.
+                accountExpanded = true;
+                renderAccount();
+                scrollTo(getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
+                    ? R.id.card_receivers : R.id.card_account); // a tablet only has the login choice
+                break;
+            case ENABLE_RECEIVE:
+                // The checkbox listener saves the flag and starts the service once;
+                // when it is already ticked only the service start is still missing.
+                accountExpanded = true;
+                renderAccount();
+                scrollTo(R.id.card_account);
+                if (accountReceiveCheck.isChecked()) startReceiver();
+                else accountReceiveCheck.setChecked(true);
+                break;
+            case DEAD_LETTERS:
+                showDeadLetters();
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void scrollTo(int viewId) {
+        View target = findViewById(viewId);
+        ScrollView scroll = findViewById(R.id.main_scroll);
+        if (target != null && scroll != null) scroll.post(() -> scroll.smoothScrollTo(0, target.getTop()));
+    }
+
+    /** Dead letters hold only ciphertext, so the list shows when, how often and why. */
+    private void showDeadLetters() {
+        CloudRelay.executor().execute(() -> {
+            List<org.json.JSONObject> rows = CloudOutboxStore.deadLetters(getApplicationContext(), 50);
+            runOnUiThread(() -> {
+                if (!activityAlive()) return;
+                if (rows.isEmpty()) {
+                    Toast.makeText(this, "没有可显示的失败记录", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                // A platform AlertDialog shows either a message or a list, so the rows go into one text.
+                StringBuilder text = new StringBuilder(
+                    "这些短信经配对云端多次发送失败，已停止重试。正文是加密的，这里只能显示时间和原因；账号和局域网路径不受影响。");
+                for (org.json.JSONObject row : rows) {
+                    String reason = row.optString("deadLetterReason", row.optString("lastError", ""));
+                    text.append("\n\n").append(android.text.format.DateFormat.format("MM-dd HH:mm", row.optLong("deadLetterAt")))
+                        .append(" · 尝试 ").append(row.optInt("attempts")).append(" 次\n")
+                        .append(reason.length() > 120 ? reason.substring(0, 120) + "…" : reason);
+                }
+                new AlertDialog.Builder(this)
+                    .setTitle(rows.size() + " 条短信多次发送失败")
+                    .setMessage(text)
+                    .setPositiveButton("知道了", null)
+                    .show();
+            });
+        });
+    }
+
+    // ---------------------------------------------------------------- recent SMS
+
+    /** Re-reads the inbox only when the history file actually changed (size or mtime). */
+    private void renderRecentIfChanged() {
+        java.io.File file = new java.io.File(getFilesDir(), "cloud-inbox.jsonl");
+        String user = AccountStore.userId(this);
+        boolean receiving = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+        // The receiver flag only changes the empty-state wording, but it must still re-render.
+        String stamp = user + "|" + receiving + "|" + file.length() + "|" + file.lastModified();
+        if (stamp.equals(recentStamp)) return;
+        recentStamp = stamp;
+        CloudRelay.executor().execute(() -> {
+            List<org.json.JSONObject> rows;
+            try { rows = CloudInboxStore.localHistory(getFilesDir(), user, RECENT_ROWS); }
+            catch (Exception e) { rows = Collections.emptyList(); }
+            final List<org.json.JSONObject> recent = rows;
+            runOnUiThread(() -> {
+                if (activityAlive() && user.equals(AccountStore.userId(this))) renderRecent(recent, user);
+            });
+        });
+    }
+
+    private void renderRecent(List<org.json.JSONObject> rows, String user) {
+        recentContainer.removeAllViews();
+        recentHint.setVisibility(rows.isEmpty() ? View.GONE : View.VISIBLE);
+        recentAll.setVisibility(rows.isEmpty() ? View.GONE : View.VISIBLE);
+        if (rows.isEmpty()) {
+            // The local inbox only holds what other devices sent here; a phone that
+            // only forwards must not be told its own SMS will show up in this list.
+            boolean receiving = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+            TextView empty = new TextView(this);
+            empty.setText(receiving
+                ? "还没有收到短信。其他设备发来的短信会显示在这里，最新的在最上面。"
+                : "这里只显示其他设备发来的短信；本机最近转发的一条在状态卡里。");
+            empty.setTextAppearance(R.style.Text_Body);
+            empty.setPadding(0, dp(8), 0, dp(8));
+            recentContainer.addView(empty);
+            return;
+        }
+        LayoutInflater inflater = LayoutInflater.from(this);
+        for (org.json.JSONObject row : rows) {
+            View item = inflater.inflate(R.layout.item_recent_sms, recentContainer, false);
+            String body = row.optString("text", "");
+            String from = row.optString("from", "短信");
+            String device = row.optString("device", "");
+            ((TextView) item.findViewById(R.id.text_recent_from)).setText(device.isEmpty() ? from : from + " · " + device);
+            ((TextView) item.findViewById(R.id.text_recent_time)).setText(shortTime(row.optLong("receivedAt")));
+            ((TextView) item.findViewById(R.id.text_recent_body)).setText(body.replace('\n', ' '));
+            String code = OtpCode.find(body);
+            TextView chip = item.findViewById(R.id.text_recent_code);
+            if (!code.isEmpty()) {
+                chip.setVisibility(View.VISIBLE);
+                chip.setText(code);
+                item.setContentDescription(from + "，验证码 " + code + "，点按复制");
+                item.setOnClickListener(v -> copyInboxText(code, user, "已复制验证码"));
+            } else {
+                item.setOnClickListener(v -> showInboxDetail(row, user));
+            }
+            item.setOnLongClickListener(v -> {
+                copyInboxText(body, user, "已复制全文");
+                return true;
+            });
+            recentContainer.addView(item);
+        }
+    }
+
+    /** Today → HH:mm; otherwise MM-dd HH:mm. */
+    private static String shortTime(long at) {
+        if (at <= 0) return "";
+        Calendar now = Calendar.getInstance();
+        Calendar then = Calendar.getInstance();
+        then.setTimeInMillis(at);
+        boolean sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR)
+            && now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR);
+        return android.text.format.DateFormat.format(sameDay ? "HH:mm" : "MM-dd HH:mm", at).toString();
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    // ---------------------------------------------------------------- receivers
+
+    /** LAN targets and cloud links in one list, each tagged; adding lives in a collapsed area. */
+    private void renderReceivers() {
+        receiversContainer.removeAllViews();
+        List<TargetStore.Target> targets = TargetStore.load(this);
+        List<CloudConfigStore.CloudLink> links = CloudConfigStore.loadLinks(this);
+        LayoutInflater inflater = LayoutInflater.from(this);
+        for (int i = 0; i < targets.size(); i++) {
+            TargetStore.Target t = targets.get(i);
+            View item = inflater.inflate(R.layout.item_receiver, receiversContainer, false);
+            ((TextView) item.findViewById(R.id.text_receiver_name)).setText(t.name);
+            ((TextView) item.findViewById(R.id.text_receiver_tag)).setText("局域网");
+            ((TextView) item.findViewById(R.id.text_receiver_detail)).setText(t.host + ":" + t.port);
+            final int idx = i;
+            item.findViewById(R.id.btn_receiver_remove).setOnClickListener(v -> {
+                List<TargetStore.Target> now = TargetStore.load(this);
+                if (idx < now.size() && now.get(idx).host.equals(t.host) && now.get(idx).port == t.port) {
+                    now.remove(idx);
+                    TargetStore.save(this, now);
+                }
+                render();
+            });
+            receiversContainer.addView(item);
+        }
+        for (CloudConfigStore.CloudLink link : links) {
+            View item = inflater.inflate(R.layout.item_receiver, receiversContainer, false);
+            String name = link.peerName.isEmpty() ? link.peerDeviceId : link.peerName;
+            ((TextView) item.findViewById(R.id.text_receiver_name)).setText(name);
+            ((TextView) item.findViewById(R.id.text_receiver_tag)).setText("云端");
+            ((TextView) item.findViewById(R.id.text_receiver_detail)).setText(
+                (link.isSender() ? "本机发送到此设备" : "本机接收此设备的短信") + " · 端到端加密");
+            item.findViewById(R.id.btn_receiver_remove).setOnClickListener(v -> confirmRemoveLink(link));
+            receiversContainer.addView(item);
+        }
+        if (targets.isEmpty() && links.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("还没有接收端。登录账号后短信会同步到网页和电脑；也可以添加局域网电脑或云端设备。");
+            empty.setTextAppearance(R.style.Text_Body);
+            empty.setPadding(0, dp(8), 0, dp(8));
+            receiversContainer.addView(empty);
+        }
+
+        addReceiverContainer.setVisibility(addReceiverExpanded ? View.VISIBLE : View.GONE);
+        addReceiverToggle.setText(addReceiverExpanded ? "收起" : "添加接收端");
         if (Build.VERSION.SDK_INT >= 33) {
             nearbyPermissionRow.setVisibility(View.VISIBLE);
             boolean nearby = checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED;
-            nearbyPermissionText.setText("附近设备：" + (nearby ? "✓ 已允许" : "○ 未允许"));
+            nearbyPermissionText.setText("附近设备权限：" + (nearby ? "已允许" : "未允许（扫描需要）"));
+            findViewById(R.id.btn_request_nearby).setVisibility(nearby ? View.GONE : View.VISIBLE);
         } else {
             nearbyPermissionRow.setVisibility(View.GONE);
         }
-        
-        // Targets
-        renderTargets();
-        
-        // Receiver
-        receiverStatusText.setText(receiverStatus());
-        accountStatusText.setText(AccountApi.statusText(this));
     }
 
-    private void renderCloudLinks() {
-        cloudLinksContainer.removeAllViews();
-        List<CloudConfigStore.CloudLink> links = CloudConfigStore.loadLinks(this);
-        
-        if (links.isEmpty()) {
-            TextView empty = new TextView(this);
-            empty.setText("暂无云链路");
-            empty.setTextSize(14);
-            empty.setPadding(16, 16, 16, 16);
-            cloudLinksContainer.addView(empty);
-            return;
+    // ---------------------------------------------------------------- account
+
+    /** One line until expanded; the form only while logged out or when a relogin is needed. */
+    private void renderAccount() {
+        boolean loggedIn = AccountStore.hasAccount(this);
+        boolean relogin = loggedIn && AccountStore.authRequired(this);
+        String name = AccountStore.username(this);
+        if (name.isEmpty()) name = AccountStore.email(this);
+        if (name.isEmpty()) name = "已登录账号";
+        accountStatusText.setText(!loggedIn ? "账号：未登录"
+            : relogin ? "账号：" + name + " · 需要重新登录" : "账号：已登录 " + name);
+        accountToggle.setText(accountExpanded ? "收起" : loggedIn ? "管理" : "登录");
+
+        accountBody.setVisibility(accountExpanded ? View.VISIBLE : View.GONE);
+        loginGroup.setVisibility(!loggedIn || relogin ? View.VISIBLE : View.GONE);
+        sessionGroup.setVisibility(loggedIn ? View.VISIBLE : View.GONE);
+        findViewById(R.id.btn_account_refresh).setVisibility(relogin ? View.GONE : View.VISIBLE);
+        if (relogin && accountUsernameEdit.getText().length() == 0) {
+            String saved = AccountStore.username(this);
+            accountUsernameEdit.setText(saved.isEmpty() ? AccountStore.email(this) : saved);
         }
-        
-        LayoutInflater inflater = LayoutInflater.from(this);
-        for (CloudConfigStore.CloudLink link : links) {
-            View item = inflater.inflate(R.layout.item_cloud_link, cloudLinksContainer, false);
-            
-            TextView nameText = item.findViewById(R.id.text_link_name);
-            TextView detailText = item.findViewById(R.id.text_link_detail);
-            Button removeBtn = item.findViewById(R.id.btn_remove_link);
-            
-            String name = link.peerName.isEmpty() ? link.peerDeviceId : link.peerName;
-            nameText.setText((link.isSender() ? "发送 → " : "接收 ← ") + name);
-            detailText.setText("本机设备 ID：" + link.deviceId + "\n对端：" + link.peerDeviceId);
-            
-            removeBtn.setOnClickListener(v -> confirmRemoveLink(link));
-            cloudLinksContainer.addView(item);
-        }
+        accountEmailEdit.setVisibility(loggedIn ? View.GONE : View.VISIBLE);
+        findViewById(R.id.btn_account_register).setVisibility(loggedIn ? View.GONE : View.VISIBLE);
     }
 
-    private void renderTargets() {
-        targetsContainer.removeAllViews();
-        List<TargetStore.Target> ts = TargetStore.load(this);
-        
-        if (ts.isEmpty()) {
-            TextView empty = new TextView(this);
-            empty.setText("暂无 LAN 接收端");
-            empty.setTextSize(14);
-            empty.setPadding(16, 16, 16, 16);
-            targetsContainer.addView(empty);
-            return;
-        }
-        
-        LayoutInflater inflater = LayoutInflater.from(this);
-        for (int i = 0; i < ts.size(); i++) {
-            TargetStore.Target t = ts.get(i);
-            View item = inflater.inflate(R.layout.item_target, targetsContainer, false);
-            
-            TextView nameText = item.findViewById(R.id.text_target_name);
-            TextView addressText = item.findViewById(R.id.text_target_address);
-            Button removeBtn = item.findViewById(R.id.btn_remove_target);
-            
-            nameText.setText(t.name);
-            addressText.setText(t.host + ":" + t.port);
-            
-            final int idx = i;
-            removeBtn.setOnClickListener(v -> {
-                List<TargetStore.Target> now = TargetStore.load(this);
-                if (idx < now.size()) {
-                    now.remove(idx);
-                    TargetStore.save(this, now);
-                    renderTargets();
-                }
-            });
-            
-            targetsContainer.addView(item);
-        }
+    // ---------------------------------------------------------------- advanced
+
+    private void renderAdvanced() {
+        advancedContainer.setVisibility(advancedExpanded ? View.VISIBLE : View.GONE);
+        advancedToggle.setText(advancedExpanded ? "收起高级设置" : "高级设置");
+        if (!advancedExpanded) return;
+        relayUrlEdit.setText(RelayHttp.PRIMARY);
+        ((TextView) findViewById(R.id.text_backup_relay_url)).setText(RelayHttp.BACKUP);
+        machineCodeText.setText(DeviceBackupManager.machineCode(this));
+        boolean sms = checkSelfPermission(Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED;
+        smsPermissionText.setText("短信权限：" + (sms ? "已允许" : "未允许"));
+        findViewById(R.id.btn_request_sms).setVisibility(sms ? View.GONE : View.VISIBLE);
+        renderDetails();
     }
 
+    /** The old multi-line diagnostics, verbatim, so nothing is lost behind the status card. */
+    private void renderDetails() {
+        boolean on = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
+        String status = on ? ReceiverService.statusText()
+            : (ReceiverService.isRunningOrStarting() ? "正在停止…" : "未启动");
+        receiverStatusText.setText("状态：" + status
+            + "\n局域网配对码：" + TargetStore.ensurePairCode(this)
+            + "\n地址：http://" + ReceiverService.localIpv4(this) + ":58123");
+        detailReceiverText.setText(receiverDetail(status));
+        cloudStatusText.setText(CloudRelay.statusText(this));
+        accountDetailText.setText(AccountApi.statusText(this));
+        backupStatusText.setText(DeviceBackupManager.statusText(this));
+    }
+
+    private String receiverDetail(String status) {
+        String pending = CloudRelay.pendingReceiverCode(this);
+        NotificationManager notifications = getSystemService(NotificationManager.class);
+        boolean notify = notifications != null && notifications.areNotificationsEnabled();
+        return "状态：" + status +
+            "\n地址：http://" + ReceiverService.localIpv4(this) + ":58123" +
+            "\n局域网配对码：" + TargetStore.ensurePairCode(this) +
+            "\n云接收链路：" + CloudConfigStore.receiverLinks(this).size() + " 条" +
+            (pending.isEmpty() ? "" : "\n云配对码（接收）：" + pending) +
+            (notify ? "" : "\n通知未开启：短信仍保存到本机历史，可在应用设置开启通知");
+    }
+
+    // ---------------------------------------------------------------- cloud pairing
 
     private void cloudPairSender() {
-        String relayUrl = relayUrlEdit.getText().toString();
+        String relayUrl = RelayHttp.PRIMARY;
         EditText code = new EditText(this);
         code.setHint("接收端显示的 6 位云配对码");
         code.setInputType(InputType.TYPE_CLASS_NUMBER);
-        
+
         new AlertDialog.Builder(this)
-            .setTitle("云端发送配对")
-            .setMessage("请先在 Windows 或 Android 云接收端创建配对会话，再输入它显示的 6 位数字。")
+            .setTitle("输入云配对码")
+            .setMessage("先在 Windows 或 Android 接收端生成云配对码，再在这里输入它显示的 6 位数字。")
             .setView(code)
             .setPositiveButton("配对", (d, w) -> {
                 String value = code.getText().toString().trim();
@@ -346,22 +704,22 @@ public class MainActivity extends Activity {
     }
 
     private void cloudPairReceiver() {
-        String relayUrl = relayUrlEdit.getText().toString();
+        String relayUrl = RelayHttp.PRIMARY;
         try {
             CloudRelay.saveRelayUrl(this, relayUrl);
         } catch (Exception e) {
             Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
             return;
         }
-        
-        Toast.makeText(this, "正在生成云接收配对码…", Toast.LENGTH_SHORT).show();
+
+        Toast.makeText(this, "正在生成云配对码…", Toast.LENGTH_SHORT).show();
         CloudRelay.startReceiverPairing(this, relayUrl, new CloudRelay.ReceiverPairCallback() {
             @Override public void started(String code) {
                 runOnUiThread(() -> {
                     if (!activityAlive()) return;
                     new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Android 云接收配对码")
-                        .setMessage("请在 Windows/Android 发送端输入此 6 位配对码：\n\n" + code + 
+                        .setTitle("云配对码")
+                        .setMessage("请在发送端手机的“添加接收端 → 输入云配对码”里输入：\n\n" + code +
                             "\n\n保持本页或接收服务运行，配对完成后会自动保存并开始接收。")
                         .setPositiveButton("知道了", null)
                         .show();
@@ -377,6 +735,8 @@ public class MainActivity extends Activity {
             }
         });
     }
+
+    // ---------------------------------------------------------------- account actions
 
     private void accountLogin() {
         setAccountBusy(true);
@@ -432,6 +792,8 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------------------- inbox
+
     private void showInbox() {
         String user = AccountStore.userId(this);
         CloudRelay.executor().execute(() -> {
@@ -453,22 +815,32 @@ public class MainActivity extends Activity {
                                 + (body.length() > 60 ? body.substring(0, 60) + "…" : body);
                     }
                     new AlertDialog.Builder(this).setTitle("本机收件箱（最近 " + rows.size() + " 条）")
-                        .setItems(labels, (dialog, which) -> {
-                            if (!user.equals(AccountStore.userId(this))) return;
-                            org.json.JSONObject row = rows.get(which);
-                            String body = row.optString("text");
-                            AlertDialog.Builder detail = new AlertDialog.Builder(this).setTitle(row.optString("from"))
-                                .setMessage(inboxMetadata(row) + "\n\n" + body)
-                                .setPositiveButton("复制全文", (d, w) -> copyInboxText(body, user)).setNegativeButton("关闭", null);
-                            java.util.regex.Matcher code = java.util.regex.Pattern.compile("(?<!\\d)(\\d{4,8})(?!\\d)").matcher(body);
-                            if (code.find()) { String value = code.group(1); detail.setNeutralButton("复制验证码", (d, w) -> copyInboxText(value, user)); }
-                            detail.show();
-                        }).setNegativeButton("关闭", null).show();
+                        .setItems(labels, (dialog, which) -> showInboxDetail(rows.get(which), user))
+                        .setNegativeButton("关闭", null).show();
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> { if (activityAlive()) Toast.makeText(this, "读取收件箱失败，请重试", Toast.LENGTH_LONG).show(); });
             }
         });
+    }
+
+    private void showInboxDetail(org.json.JSONObject row, String user) {
+        if (!activityAlive() || !user.equals(AccountStore.userId(this))) return;
+        String body = row.optString("text");
+        AlertDialog.Builder detail = new AlertDialog.Builder(this).setTitle(row.optString("from"))
+            .setMessage(inboxMetadata(row) + "\n\n" + body)
+            .setPositiveButton("复制全文", (d, w) -> copyInboxText(body, user, "已复制全文")).setNegativeButton("关闭", null);
+        // Prefer an explicit OTP; fall back to the legacy digit rule so manual copy still works.
+        String value = OtpCode.find(body);
+        if (value.isEmpty()) {
+            java.util.regex.Matcher code = java.util.regex.Pattern.compile("(?<!\\d)(\\d{4,8})(?!\\d)").matcher(body);
+            if (code.find()) value = code.group(1);
+        }
+        if (!value.isEmpty()) {
+            String copied = value;
+            detail.setNeutralButton("复制 " + copied, (d, w) -> copyInboxText(copied, user, "已复制验证码"));
+        }
+        detail.show();
     }
 
     private String inboxMetadata(org.json.JSONObject row) {
@@ -478,12 +850,17 @@ public class MainActivity extends Activity {
             + java.text.DateFormat.getDateTimeInstance().format(new Date(row.optLong("receivedAt")));
     }
 
-    private void copyInboxText(String text, String user) {
+    /** SMS bodies and codes are sensitive: keep them out of the system copy preview. */
+    private void copyInboxText(String text, String user, String confirmation) {
         if (!activityAlive() || !user.equals(AccountStore.userId(this))) return;
-        ClipboardManager clipboard = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-        if (clipboard != null) clipboard.setPrimaryClip(ClipData.newPlainText("MsgDock", text));
-        Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show();
+        if (OtpCopyReceiver.copy(this, text)) {
+            if (Build.VERSION.SDK_INT < 33) Toast.makeText(this, confirmation, Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "复制失败，请重试", Toast.LENGTH_SHORT).show();
+        }
     }
+
+    // ---------------------------------------------------------------- device backup
 
     private void copyMachineCode() {
         String code = DeviceBackupManager.machineCode(this);
@@ -508,10 +885,10 @@ public class MainActivity extends Activity {
     private void confirmRemoveLink(CloudConfigStore.CloudLink link) {
         String name = link.peerName.isEmpty() ? link.peerDeviceId : link.peerName;
         new AlertDialog.Builder(this)
-            .setTitle("删除云链路？")
-            .setMessage("将撤销'" + name + "'的云端链路，并清理关联待发送消息。此操作不可自动恢复。")
+            .setTitle("移除云端设备？")
+            .setMessage("将撤销与“" + name + "”的云端链路，并清理关联待发送消息。此操作不可自动恢复。")
             .setNegativeButton("取消", null)
-            .setPositiveButton("确认删除", (d, w) -> {
+            .setPositiveButton("确认移除", (d, w) -> {
                 Toast.makeText(this, "正在撤销云链路…", Toast.LENGTH_SHORT).show();
                 DeviceBackupManager.removeLink(this, link, (ok, message) -> {
                     if (!activityAlive()) return;
@@ -538,23 +915,10 @@ public class MainActivity extends Activity {
             .show();
     }
 
-    private String receiverStatus() {
-        boolean on = TargetStore.prefs(this).getBoolean(ReceiverService.PREF_RECEIVER_ENABLED, false);
-        String pending = CloudRelay.pendingReceiverCode(this);
-        String status = on ? ReceiverService.statusText()
-            : (ReceiverService.isRunningOrStarting() ? "正在停止…" : "未启动");
-        NotificationManager notifications = getSystemService(NotificationManager.class);
-        boolean notify = notifications != null && notifications.areNotificationsEnabled();
-        return "状态：" + status +
-            "\n地址：http://" + ReceiverService.localIpv4(this) + ":58123" +
-            "\nLAN 配对码：" + TargetStore.ensurePairCode(this) +
-            "\n云接收链路：" + CloudConfigStore.receiverLinks(this).size() + " 条" +
-            (pending.isEmpty() ? "" : "\n云接收配对码：" + pending) +
-            (notify ? "" : "\n通知未开启：短信仍保存到本机历史，可在应用设置开启通知");
-    }
+    // ---------------------------------------------------------------- receiver service
 
     private void startReceiver() {
-        if (Build.VERSION.SDK_INT >= 33 && 
+        if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             askPermission(Manifest.permission.POST_NOTIFICATIONS, REQUEST_NOTIFICATIONS);
             return;
@@ -590,9 +954,11 @@ public class MainActivity extends Activity {
         render();
     }
 
+    // ---------------------------------------------------------------- LAN targets
+
     private void scanLan() {
         if (scanning) return;
-        if (Build.VERSION.SDK_INT >= 33 && 
+        if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
             askPermission(Manifest.permission.NEARBY_WIFI_DEVICES, REQUEST_SCAN);
             return;
@@ -603,7 +969,7 @@ public class MainActivity extends Activity {
         scanButton.setText("正在扫描…");
         Toast.makeText(this, "正在扫描约 5 秒…", Toast.LENGTH_SHORT).show();
         discovered.clear();
-        
+
         scanThread = new Thread(() -> {
             long end = SystemClock.elapsedRealtime() + 5200;
             String failure = null;
@@ -614,7 +980,7 @@ public class MainActivity extends Activity {
                 LanNet.bindWifi(this, ds);
                 ds.setSoTimeout(600);
                 byte[] buf = new byte[1024];
-                
+
                 while (!Thread.currentThread().isInterrupted() && SystemClock.elapsedRealtime() < end) {
                     try {
                         DatagramPacket p = new DatagramPacket(buf, buf.length);
@@ -643,7 +1009,7 @@ public class MainActivity extends Activity {
                 scanning = false;
                 scanThread = null;
                 scanButton.setEnabled(true);
-                scanButton.setText("扫描 LAN");
+                scanButton.setText("扫描局域网");
                 if (error != null) new AlertDialog.Builder(this).setTitle("无法扫描")
                     .setMessage(error).setPositiveButton("知道了", null).show();
                 else showDiscovered();
@@ -656,12 +1022,12 @@ public class MainActivity extends Activity {
         if (discovered.isEmpty()) {
             new AlertDialog.Builder(this)
                 .setTitle("未发现设备")
-                .setMessage("请确认 Windows EXE 或 Pad 接收端正在运行且处于同一 Wi‑Fi。也可以使用'手动添加 IP'。")
+                .setMessage("请确认 Windows 或 Android 接收端正在运行且处于同一 Wi‑Fi。也可以使用“手动添加”。")
                 .setPositiveButton("知道了", null)
                 .show();
             return;
         }
-        
+
         String[] labels = new String[discovered.size()];
         for (int i = 0; i < labels.length; i++) {
             labels[i] = discovered.get(i).label();
@@ -674,22 +1040,22 @@ public class MainActivity extends Activity {
 
     private void askPairCode(TargetStore.Target base) {
         EditText code = new EditText(this);
-        code.setHint("接收端显示的 6 位配对码");
+        code.setHint("接收端显示的 6 位局域网配对码");
         code.setInputType(InputType.TYPE_CLASS_NUMBER);
-        
+
         new AlertDialog.Builder(this)
             .setTitle("配对 " + base.name)
             .setView(code)
             .setPositiveButton("保存", (d, w) -> {
                 String c = code.getText().toString().trim();
                 if (c.length() != 6) {
-                    Toast.makeText(this, "配对码应为 6 位", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "局域网配对码应为 6 位", Toast.LENGTH_LONG).show();
                     return;
                 }
                 List<TargetStore.Target> ts = TargetStore.load(this);
                 ts.add(new TargetStore.Target(base.name, base.host, base.port, c));
                 TargetStore.save(this, ts);
-                renderTargets();
+                render();
             })
             .setNegativeButton("取消", null)
             .show();
@@ -698,37 +1064,37 @@ public class MainActivity extends Activity {
     private void manualAdd() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        int p = 24;
+        int p = dp(16);
         box.setPadding(p, p, p, p);
-        
+
         EditText name = new EditText(this);
-        name.setHint("名称，例如 Gaming-PC");
+        name.setHint("名称，例如 Office-PC");
         EditText host = new EditText(this);
         host.setHint("IP，例如 192.168.1.20");
         EditText code = new EditText(this);
-        code.setHint("6 位配对码");
+        code.setHint("6 位局域网配对码");
         code.setInputType(InputType.TYPE_CLASS_NUMBER);
-        
+
         box.addView(name);
         box.addView(host);
         box.addView(code);
-        
+
         new AlertDialog.Builder(this)
-            .setTitle("手动添加接收端")
+            .setTitle("手动添加局域网电脑")
             .setView(box)
             .setPositiveButton("保存", (d, w) -> {
-                if (host.getText().toString().trim().isEmpty() || 
+                if (host.getText().toString().trim().isEmpty() ||
                     code.getText().toString().trim().length() != 6) {
-                    Toast.makeText(this, "请填写 IP 和 6 位配对码", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "请填写 IP 和 6 位局域网配对码", Toast.LENGTH_LONG).show();
                     return;
                 }
                 List<TargetStore.Target> ts = TargetStore.load(this);
-                String targetName = name.getText().toString().trim().isEmpty() ? 
+                String targetName = name.getText().toString().trim().isEmpty() ?
                     "Manual" : name.getText().toString().trim();
-                ts.add(new TargetStore.Target(targetName, host.getText().toString().trim(), 58123, 
+                ts.add(new TargetStore.Target(targetName, host.getText().toString().trim(), 58123,
                     code.getText().toString().trim()));
                 TargetStore.save(this, ts);
-                renderTargets();
+                render();
             })
             .setNegativeButton("取消", null)
             .show();
@@ -737,21 +1103,28 @@ public class MainActivity extends Activity {
     private void sendTest() {
         List<TargetStore.Target> ts = TargetStore.load(this);
         if (ts.isEmpty() && !CloudConfigStore.isConfigured(CloudConfigStore.load(this))) {
-            Toast.makeText(this, "请先添加 LAN 接收端或完成云端配对", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "请先添加局域网电脑或输入云配对码", Toast.LENGTH_LONG).show();
             return;
         }
-        Forwarder.forwardAsync(this, UUID.randomUUID().toString(), "MsgDock", 
+        Forwarder.forwardAsync(this, UUID.randomUUID().toString(), "MsgDock",
             "测试消息：局域网/云端短信转发已连通。验证码 123456", System.currentTimeMillis(), -1);
-        Toast.makeText(this, "已发送测试消息（LAN 与云端共用同一 ID）", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "已发送测试消息（局域网与云端共用同一 ID）", Toast.LENGTH_SHORT).show();
     }
 
+    // ---------------------------------------------------------------- system shortcuts
+
+    /** Direct whitelist prompt first, then the system list, then app info; never a crash. */
     private void requestBatteryWhitelist() {
         try {
-            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, 
+            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                 Uri.parse("package:" + getPackageName()));
             startActivity(i);
         } catch (Exception e) {
-            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (Exception ignored) {
+                openAppSettings();
+            }
         }
     }
 
@@ -774,7 +1147,7 @@ public class MainActivity extends Activity {
             "adb shell dumpsys deviceidle whitelist +" + pkg;
         ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE))
             .setPrimaryClip(ClipData.newPlainText("ADB/Shizuku", cmd));
-        
+
         new AlertDialog.Builder(this)
             .setTitle("已复制")
             .setMessage(cmd + "\n\n可在电脑 ADB 中执行；使用 Shizuku 时，可在 rish/支持 Shizuku 的终端中去掉每行开头的 `adb shell ` 后执行。" +
@@ -784,6 +1157,6 @@ public class MainActivity extends Activity {
     }
 
     private boolean activityAlive() {
-        return !isFinishing() && (Build.VERSION.SDK_INT < 17 || !isDestroyed());
+        return !isFinishing() && !isDestroyed();
     }
 }

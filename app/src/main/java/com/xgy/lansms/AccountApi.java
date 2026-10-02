@@ -166,18 +166,27 @@ public final class AccountApi {
                 try {
                     JSONObject body = AccountOutboxStore.payload(entry.clientMessageId, entry.sender,
                             entry.body, entry.receivedAt);
-                    HttpResult result = request("POST", endpoint("/messages"), body,
-                            uploadToken, false);
+                    HttpResult result;
+                    SyncClock.beginRequest(); // status bookkeeping only
+                    try {
+                        result = request("POST", endpoint("/messages"), body, uploadToken, false);
+                    } finally {
+                        SyncClock.endRequest();
+                    }
                     synchronized (AccountStore.LOCK) {
                     if (!uploadUser.equals(AccountStore.userId(app)) || !uploadToken.equals(AccountStore.deviceToken(app))) return false;
                     if (result.status >= 200 && result.status < 300) {
                         AccountOutboxStore.remove(app, entry.clientMessageId);
+                        SyncClock.markSuccess(app);
+                        SyncClock.markForwarded(app, "账号");
                     } else {
                         if (result.status == 401 || result.status == 403) AccountStore.requireLogin(app);
+                        else SyncClock.markFailure();
                         AccountOutboxStore.markFailure(app, entry.clientMessageId, httpError(result));
                     }
                     }
                 } catch (Exception e) {
+                    SyncClock.markFailure();
                     synchronized (AccountStore.LOCK) {
                         if (uploadUser.equals(AccountStore.userId(app)) && uploadToken.equals(AccountStore.deviceToken(app)))
                             AccountOutboxStore.markFailure(app, entry.clientMessageId, errorMessage(e));
@@ -263,6 +272,7 @@ public final class AccountApi {
                     null, token, false), "接收失败");
             JSONArray rows = response.getJSONArray("messages");
             validatePage(rows, after);
+            String receivedFrom = null;
             synchronized (AccountStore.LOCK) {
                 if (!sameReceiver(app, user, token)) return true; // Discard late responses after logout/account switch.
                 for (int i = 0; i < rows.length(); i++) {
@@ -271,15 +281,19 @@ public final class AccountApi {
                         throw new IllegalStateException("无法保存账号收件箱，稍后重试");
                     // History and pending notification must be durable BEFORE committing the cursor.
                     AccountStore.saveLastSeq(app, sms.getLong("seq"));
+                    if (!sms.optBoolean("silent", false)) receivedFrom = sms.optString("device", "");
                 }
                 AccountStore.setReceiveStatus(app, "已连接 · 收件进度 " + AccountStore.lastSeq(app));
             }
+            if (receivedFrom != null) SyncClock.markReceived(app, receivedFrom);
+            SyncClock.markSuccess(app);
             return true;
         } catch (Exception e) {
+            boolean auth = e instanceof ApiException && (((ApiException)e).status == 401 || ((ApiException)e).status == 403);
+            if (!auth) SyncClock.markFailure();
             synchronized (AccountStore.LOCK) {
                 if (sameReceiver(app, user, token)) {
-                    if (e instanceof ApiException && (((ApiException)e).status == 401 || ((ApiException)e).status == 403))
-                        AccountStore.requireLogin(app);
+                    if (auth) AccountStore.requireLogin(app);
                     AccountStore.setReceiveStatus(app, "暂未连接，自动重试");
                 }
             }

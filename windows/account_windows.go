@@ -92,6 +92,11 @@ type accountStatusSnapshot struct {
 	LastSeq  int64
 	DeviceID string
 	LoggedIn bool
+	// LastSuccessAt and FailingSince are read-only bookkeeping for the status
+	// model (DESIGN.md 同步状态模型). setState maintains them from State; they
+	// never influence polling or backoff.
+	LastSuccessAt time.Time
+	FailingSince  time.Time
 }
 
 type accountHTTPError struct {
@@ -158,6 +163,9 @@ func newAccountClient(app *App) *accountClient {
 		}
 		if credentials.DeviceToken != "" {
 			state.State = "已连接"
+			// Seed the delay timer with the start time so the first 3 s before the
+			// initial poll are not reported as 延迟 and a dead server is noticed.
+			state.LastSuccessAt = time.Now()
 		}
 	}
 	return &accountClient{
@@ -259,7 +267,23 @@ func (c *accountClient) setState(state accountStatusSnapshot) {
 	if state.Backoff <= 0 {
 		state.Backoff = accountPollInterval
 	}
+	now := time.Now()
 	c.stateMu.Lock()
+	previous := c.state
+	switch state.State {
+	case "已连接":
+		state.LastSuccessAt = now
+	case "云同步重试中":
+		state.LastSuccessAt = previous.LastSuccessAt
+		state.FailingSince = previous.FailingSince
+		if state.FailingSince.IsZero() {
+			state.FailingSince = now
+		}
+	default:
+		// Not polling (logged out, no device) or an auth failure, which DESIGN.md
+		// judges separately from "continuously unreachable".
+		state.LastSuccessAt = previous.LastSuccessAt
+	}
 	c.state = state
 	c.stateMu.Unlock()
 }
@@ -533,6 +557,13 @@ func (c *accountClient) pollOnce(ctx context.Context) error {
 		return err
 	}
 	lastSeq := credentials.LastSeq
+	for _, message := range response.Messages {
+		if message.Seq > lastSeq {
+			c.app.beginSending()
+			defer c.app.endSending()
+			break
+		}
+	}
 	for _, message := range response.Messages {
 		if message.Seq <= lastSeq {
 			continue

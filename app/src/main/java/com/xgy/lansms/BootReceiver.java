@@ -26,8 +26,20 @@ public class BootReceiver extends BroadcastReceiver {
     public static void scheduleReceiverRestart(Context context) {
         AlarmManager alarm = (AlarmManager) context.getApplicationContext().getSystemService(Context.ALARM_SERVICE);
         if (alarm == null) return;
-        alarm.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + 1000L, restartPendingIntent(context));
+        long at = SystemClock.elapsedRealtime() + 1000L;
+        PendingIntent restart = restartPendingIntent(context);
+        // Android 12+ refuses background foreground-service starts from inexact alarms
+        // unless the app is exempt from battery optimisation; an exact alarm is one of
+        // the documented exemptions, so prefer it whenever the system grants it.
+        try {
+            if (Build.VERSION.SDK_INT < 31 || alarm.canScheduleExactAlarms()) {
+                alarm.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, restart);
+                return;
+            }
+        } catch (SecurityException ignored) {
+            // Fall through to the inexact alarm used before.
+        }
+        alarm.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, restart);
     }
 
     public static void cancelReceiverRestart(Context context) {

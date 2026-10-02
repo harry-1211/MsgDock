@@ -10,7 +10,7 @@
         <item name="android:colorAccent">@color/accent_primary</item>
     </style>
 
-    <!-- Text styles -->
+    <!-- Text: three tiers. Title 16sp white, body 14sp slate-200, caption 12sp slate-400. -->
     <style name="Text">
         <item name="android:textSize">@dimen/text_body</item>
         <item name="android:textColor">@color/text_secondary</item>
@@ -23,6 +23,7 @@
         <item name="android:letterSpacing">-0.02</item>
     </style>
 
+    <!-- Only for the sync-state headline and screen titles. -->
     <style name="Text.Title.Large">
         <item name="android:textSize">@dimen/text_title_large</item>
         <item name="android:textColor">@color/text_primary</item>
@@ -38,18 +39,29 @@
     <style name="Text.Body.Large">
         <item name="android:textSize">@dimen/text_body_large</item>
         <item name="android:textColor">@color/text_secondary</item>
-        <item name="android:lineSpacingMultiplier">1.5</item>
+        <item name="android:lineSpacingMultiplier">1.4</item>
     </style>
 
     <style name="Text.Body">
         <item name="android:textSize">@dimen/text_body</item>
         <item name="android:textColor">@color/text_secondary</item>
-        <item name="android:lineSpacingMultiplier">1.5</item>
+        <item name="android:lineSpacingMultiplier">1.4</item>
     </style>
 
     <style name="Text.Caption">
         <item name="android:textSize">@dimen/text_caption</item>
         <item name="android:textColor">@color/text_tertiary</item>
+    </style>
+
+    <!-- Small uppercase-feel label such as "局域网" / "云端" beside a device name. -->
+    <style name="Text.Tag">
+        <item name="android:textSize">@dimen/text_caption</item>
+        <item name="android:textColor">@color/text_tertiary</item>
+        <item name="android:background">@drawable/tag_background</item>
+        <item name="android:paddingStart">@dimen/spacing_sm</item>
+        <item name="android:paddingEnd">@dimen/spacing_sm</item>
+        <item name="android:paddingTop">2dp</item>
+        <item name="android:paddingBottom">2dp</item>
     </style>
 
     <!-- Card container -->
@@ -60,13 +72,18 @@
         <item name="android:elevation">@dimen/card_elevation</item>
     </style>
 
-    <!-- Button styles -->
+    <!-- Buttons: all backgrounds are ripple-wrapped shapes; text wraps rather than clips. -->
     <style name="Button">
         <item name="android:textSize">@dimen/text_body</item>
         <item name="android:textColor">@color/text_primary</item>
         <item name="android:textAllCaps">false</item>
+        <item name="android:minHeight">@dimen/button_height</item>
+        <item name="android:paddingTop">@dimen/spacing_sm</item>
+        <item name="android:paddingBottom">@dimen/spacing_sm</item>
+        <item name="android:stateListAnimator">@null</item>
     </style>
 
+    <!-- The one cyan element per card: the primary action. -->
     <style name="Button.Primary">
         <item name="android:background">@drawable/button_primary</item>
         <item name="android:textColor">@color/surface_00</item>
@@ -74,19 +91,15 @@
         <item name="android:fontFamily">sans-serif-medium</item>
         <item name="android:paddingStart">@dimen/spacing_lg</item>
         <item name="android:paddingEnd">@dimen/spacing_lg</item>
-        <item name="android:minHeight">@dimen/button_height</item>
-        <item name="android:textAllCaps">false</item>
     </style>
 
     <style name="Button.Secondary">
         <item name="android:background">@drawable/button_secondary</item>
-        <item name="android:textColor">@color/accent_primary</item>
-        <item name="android:textSize">@dimen/text_body_large</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">@dimen/text_body</item>
         <item name="android:fontFamily">sans-serif-medium</item>
         <item name="android:paddingStart">@dimen/spacing_lg</item>
         <item name="android:paddingEnd">@dimen/spacing_lg</item>
-        <item name="android:minHeight">@dimen/button_height</item>
-        <item name="android:textAllCaps">false</item>
     </style>
 
     <style name="Button.Outlined">
@@ -95,8 +108,17 @@
         <item name="android:textSize">@dimen/text_body</item>
         <item name="android:paddingStart">@dimen/spacing_md</item>
         <item name="android:paddingEnd">@dimen/spacing_md</item>
-        <item name="android:minHeight">@dimen/button_height</item>
-        <item name="android:textAllCaps">false</item>
+    </style>
+
+    <!-- Text-only link action (cyan), for "查看全部" and expand/collapse toggles. -->
+    <style name="Button.Link">
+        <item name="android:background">@drawable/button_link</item>
+        <item name="android:textColor">@color/accent_primary</item>
+        <item name="android:textSize">@dimen/text_body</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:paddingStart">@dimen/spacing_sm</item>
+        <item name="android:paddingEnd">@dimen/spacing_sm</item>
+        <item name="android:minWidth">0dp</item>
     </style>
 
     <!-- Input field -->

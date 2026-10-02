@@ -25,7 +25,8 @@ func TestNativeToastTagGroupAndSuppression(t *testing.T) {
 	}
 	defer toastCombase.NewProc("RoUninitialize").Call()
 	for _, suppress := range []bool{false, true} {
-		toast, err := newTaggedToast(buildSMSNotificationXML(SMS{From: "Test <sender>", Text: "验证码 123456 & 测试"}), suppress)
+		sms := SMS{From: "Test <sender>", Text: "验证码 123456 & 测试"}
+		toast, err := newTaggedToast(buildSMSNotificationXML(sms), smsToastTagFor(sms.From), suppress)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -37,7 +38,7 @@ func TestNativeToastTagGroupAndSuppression(t *testing.T) {
 		for _, tc := range []struct {
 			slot int
 			want string
-		}{{7, smsToastTag}, {9, smsToastGroup}} {
+		}{{7, smsToastTagFor(sms.From)}, {9, smsToastGroup}} {
 			var value ole.HString
 			if err := toastCOMCall(&properties.IUnknown, tc.slot, uintptr(unsafe.Pointer(&value))); err != nil {
 				t.Fatal(err)
@@ -129,7 +130,7 @@ func TestNativeToastHistoryReplacement(t *testing.T) {
 		t.Fatal("test identity unexpectedly has existing notifications")
 	}
 	for i := 0; i < 3; i++ {
-		if err := pushTaggedToast(appID, buildSMSNotificationXML(SMS{From: "MsgDock test", Text: fmt.Sprintf("Synthetic message %d", i)}), true); err != nil {
+		if err := pushTaggedToast(appID, buildSMSNotificationXML(SMS{From: "MsgDock test", Text: fmt.Sprintf("Synthetic message %d", i)}), smsToastTagFor("MsgDock test"), true); err != nil {
 			t.Fatal(err)
 		}
 		var size uint32

@@ -146,7 +146,7 @@ public final class CloudRelay {
                 if (callback != null) callback.completed(true, "云端接收配对成功：" + link.deviceId);
                 return;
             }
-            throw new IllegalStateException("云接收配对码已过期");
+            throw new IllegalStateException("云配对码已过期");
         } catch (Exception e) {
             TargetStore.prefs(app).edit().putString("cloud_last_error", errorMessage(e)).apply();
             if (callback != null) callback.completed(false, errorMessage(e));
@@ -162,12 +162,24 @@ public final class CloudRelay {
 
     /** Encrypts and durably enqueues one SMS for every sender link. */
     public static void enqueueSms(Context context, String id, String from, String text, long receivedAt, int sim, String device) {
+        if (enqueueSmsWithoutFlush(context, id, from, text, receivedAt, sim, device)) {
+            Context app = context.getApplicationContext();
+            EXECUTOR.execute(() -> flushOutbox(app));
+        }
+    }
+
+    /**
+     * Same as above but leaves the first flush to the caller, so the SMS broadcast can
+     * wait for it while the system still grants network access. Returns true if queued.
+     */
+    static boolean enqueueSmsWithoutFlush(Context context, String id, String from, String text,
+                                          long receivedAt, int sim, String device) {
         Context app = context.getApplicationContext();
         String messageId = id == null || id.isEmpty() ? UUID.randomUUID().toString() : id;
         List<CloudConfigStore.CloudLink> links = CloudConfigStore.senderLinks(app);
         if (links.isEmpty()) {
             TargetStore.prefs(app).edit().putString("cloud_last_error", "未完成云端发送配对，短信仅通过 LAN 转发").apply();
-            return;
+            return false;
         }
         boolean queued = false;
         for (CloudConfigStore.CloudLink link : links) {
@@ -187,7 +199,8 @@ public final class CloudRelay {
                 CloudOutboxStore.enqueue(app, envelope); queued = true;
             } catch (Exception e) { TargetStore.prefs(app).edit().putString("cloud_last_error", errorMessage(e)).apply(); }
         }
-        if (queued) { CloudSyncJobService.schedule(app); EXECUTOR.execute(() -> flushOutbox(app)); }
+        if (queued) CloudSyncJobService.schedule(app);
+        return queued;
     }
 
     public static void flushOutbox(Context context) {
@@ -198,20 +211,32 @@ public final class CloudRelay {
                     JSONObject envelope = new JSONObject(entry.envelope);
                     CloudConfigStore.CloudLink link = findSender(app, envelope.optString("roomId", ""), envelope.optString("senderDeviceId", ""), envelope.optString("targetDeviceId", ""));
                     if (link == null) { CloudOutboxStore.moveToDeadLetter(app, entry.key, "找不到对应的云端发送链路，已停止重试"); continue; }
-                    HttpResult result = requestJson("POST", normalizeRelayUrl(link.relayUrl) + "/v1/messages", envelope, link.token);
+                    HttpResult result;
+                    SyncClock.beginRequest(); // status bookkeeping only
+                    try {
+                        result = requestJson("POST", normalizeRelayUrl(link.relayUrl) + "/v1/messages", envelope, link.token);
+                    } finally {
+                        SyncClock.endRequest();
+                    }
                     if (result.status >= 200 && result.status < 300) {
                         CloudOutboxStore.remove(app, entry.key);
                         CloudOutboxStore.markSuccess(app);
+                        SyncClock.markSuccess(app);
+                        SyncClock.markForwarded(app, link.peerName.isEmpty() ? "云端设备" : link.peerName);
                     } else {
                         String message = "云端发送 HTTP " + result.status + ": " + result.body;
                         if (result.status == 401 || result.status == 403 || result.status == 410
                                 || result.body.toLowerCase(Locale.ROOT).contains("created_at_out_of_range")) {
                             CloudOutboxStore.moveToDeadLetter(app, entry.key, message);
                         } else {
+                            SyncClock.markFailure();
                             CloudOutboxStore.markFailure(app, entry.key, message);
                         }
                     }
-                } catch (Exception e) { CloudOutboxStore.markFailure(app, entry.key, errorMessage(e)); }
+                } catch (Exception e) {
+                    SyncClock.markFailure();
+                    CloudOutboxStore.markFailure(app, entry.key, errorMessage(e));
+                }
             }
         } finally { FLUSHING.set(false); }
     }
@@ -237,6 +262,7 @@ public final class CloudRelay {
                 try { newMessages += pollReceiverLink(app, link); }
                 catch (Exception e) {
                     success = false;
+                    SyncClock.markFailure();
                     TargetStore.prefs(app).edit().putString("cloud_receive_last_error", errorMessage(e)).apply();
                 }
             }
@@ -274,6 +300,7 @@ public final class CloudRelay {
                             CloudCrypto.aad(id, link.roomId, link.peerDeviceId, link.deviceId).getBytes(StandardCharsets.UTF_8));
                     sms = new JSONObject(new String(plaintext, StandardCharsets.UTF_8));
                     if (!CloudInboxStore.acceptCloud(app, id, sms)) throw new IllegalStateException("云端短信持久化失败");
+                    SyncClock.markReceived(app, sms.optString("device", "Android"));
                     sms = CloudInboxStore.pending(app, id);
                 }
                 if (sms != null && CloudInboxStore.isDelivered(app, id)) {
@@ -299,7 +326,11 @@ public final class CloudRelay {
             HttpResult acknowledged = requestJson("POST", normalizeRelayUrl(link.relayUrl) + "/v1/ack", body, link.token);
             if (acknowledged.status < 200 || acknowledged.status >= 300) throw new IllegalStateException("云端 ACK HTTP " + acknowledged.status);
         }
-        if (!ack.isEmpty()) TargetStore.prefs(app).edit().putLong("cloud_receive_last_success", System.currentTimeMillis()).remove("cloud_receive_last_error").apply();
+        if (!ack.isEmpty()) {
+            TargetStore.prefs(app).edit().putLong("cloud_receive_last_success", System.currentTimeMillis()).remove("cloud_receive_last_error").apply();
+        }
+        // The round trip (GET and any ACK) reached the relay: the link is alive even when idle.
+        SyncClock.markSuccess(app);
         return newMessages;
     }
 
@@ -318,7 +349,7 @@ public final class CloudRelay {
         long nextDelay = TargetStore.prefs(app).getLong("cloud_receive_next_delay_ms", 5000L);
         if (CloudConfigStore.receiverLinks(app).isEmpty()) out.append("\n云接收轮询：不请求网络（无接收链路）");
         else out.append("\n云接收轮询：").append(nextDelay / 1000L).append(" 秒后");
-        String code = pendingReceiverCode(app); if (!code.isEmpty()) out.append("\n接收配对码：").append(code);
+        String code = pendingReceiverCode(app); if (!code.isEmpty()) out.append("\n云配对码（接收）：").append(code);
         long received = TargetStore.prefs(app).getLong("cloud_receive_last_success", 0L); if (received > 0) out.append("\n最近接收：").append(android.text.format.DateFormat.format("MM-dd HH:mm:ss", received));
         String error = TargetStore.prefs(app).getString("cloud_last_error", ""); if (!error.isEmpty()) out.append("\n最近错误：").append(error);
         String receiveError = TargetStore.prefs(app).getString("cloud_receive_last_error", "");

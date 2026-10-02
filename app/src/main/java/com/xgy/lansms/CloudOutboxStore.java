@@ -172,6 +172,28 @@ public final class CloudOutboxStore {
         }
     }
 
+    /**
+     * Newest-first dead letters for the home screen. Envelopes are ciphertext, so a
+     * row only carries the time, the attempt count and the reason; nothing is
+     * modified or pruned.
+     */
+    public static List<JSONObject> deadLetters(Context context, int limit) {
+        synchronized (LOCK) {
+            List<JSONObject> out = new ArrayList<>();
+            File file = new File(context.getFilesDir(), DEAD_FILE_NAME);
+            if (!file.isFile() || limit <= 0) return out;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    new FileInputStream(file), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    try { out.add(new JSONObject(line)); } catch (Exception ignored) { }
+                }
+            } catch (Exception ignored) { }
+            java.util.Collections.reverse(out);
+            return out.size() > limit ? new ArrayList<>(out.subList(0, limit)) : out;
+        }
+    }
+
     public static String lastError(Context context) {
         return TargetStore.prefs(context).getString(KEY_LAST_ERROR, "");
     }
